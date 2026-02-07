@@ -58,6 +58,15 @@ export default function TabLayout() {
                     tabBarIcon: ({ color }) => <FontAwesome name="money" size={24} color={color} />,
                 }}
             />
+
+            <Tabs.Screen
+                name="inventario"
+                options={{
+                    title: 'Inventario',
+                    tabBarIcon: ({ color }) => <FontAwesome name="archive" size={24} color={color} />,
+                }}
+            />
+
             <Tabs.Screen
                 name="configuracion"
                 options={{
@@ -66,13 +75,7 @@ export default function TabLayout() {
                 }}
             />
             {/* Opcionales/Existentes si se desean mantener */}
-            <Tabs.Screen
-                name="inventario"
-                options={{
-                    title: 'Inventario',
-                    tabBarIcon: ({ color }) => <FontAwesome name="archive" size={24} color={color} />,
-                }}
-            />
+
         </Tabs>
     );
 }
