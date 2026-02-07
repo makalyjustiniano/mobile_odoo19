@@ -16,12 +16,15 @@ import { FontAwesome } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
 import { testConnection2, testConnection } from '../src/api/odooClient';
 import { useAuthStore } from '../src/store/authStore';
+import { useConfigStore } from '../src/store/configStore';
 
 export default function LoginScreen() {
   const router = useRouter();
   const login = useAuthStore((state) => state.login);
+  const getActiveProfile = useConfigStore((state) => state.getActiveProfile);
+  const activeProfile = getActiveProfile();
 
-  const [url, setUrl] = useState('https://brixy-staging-28261857.dev.odoo.com');
+  const [url, setUrl] = useState(activeProfile?.url || 'https://brixy-staging-28261857.dev.odoo.com');
   const [apiKey, setApiKey] = useState('e6c0484bddd4f9354010c515c433d97503c87757');
   const [database, setDatabase] = useState('brixy-staging-28261857');
   const [username, setUsername] = useState('admin');
@@ -40,6 +43,10 @@ export default function LoginScreen() {
 
       // Si tiene éxito, guardamos y navegamos
       login({ url, apiKey, database, username });
+
+      // Si el perfil activo es el que acabamos de usar, nos aseguramos de que la URL esté guardada
+      // (Podríamos añadir lógica aquí para actualizar el perfil si el usuario cambió la URL manualmente)
+
       console.log('Login exitoso, redirigiendo...');
       router.replace('/(tabs)/home');
     } catch (error: any) {

@@ -27,30 +27,50 @@ export default function TabLayout() {
                 name="home"
                 options={{
                     title: 'Inicio',
-                    tabBarIcon: ({ color }) => <FontAwesome name="home" size={28} color={color} />,
+                    tabBarIcon: ({ color }) => <FontAwesome name="th-large" size={24} color={color} />,
+                }}
+            />
+            <Tabs.Screen
+                name="clientes"
+                options={{
+                    title: 'Clientes',
+                    tabBarIcon: ({ color }) => <FontAwesome name="users" size={24} color={color} />,
                 }}
             />
             <Tabs.Screen
                 name="ventas"
                 options={{
                     title: 'Ventas',
-                    tabBarIcon: ({ color }) => <FontAwesome name="shopping-cart" size={28} color={color} />,
+                    tabBarIcon: ({ color }) => <FontAwesome name="shopping-cart" size={24} color={color} />,
                 }}
             />
-
+            <Tabs.Screen
+                name="distribucion"
+                options={{
+                    title: 'Distribución',
+                    tabBarIcon: ({ color }) => <FontAwesome name="truck" size={24} color={color} />,
+                }}
+            />
+            <Tabs.Screen
+                name="cobranzas"
+                options={{
+                    title: 'Cobranzas',
+                    tabBarIcon: ({ color }) => <FontAwesome name="money" size={24} color={color} />,
+                }}
+            />
+            <Tabs.Screen
+                name="configuracion"
+                options={{
+                    title: 'Ajustes',
+                    tabBarIcon: ({ color }) => <FontAwesome name="cog" size={24} color={color} />,
+                }}
+            />
+            {/* Opcionales/Existentes si se desean mantener */}
             <Tabs.Screen
                 name="inventario"
                 options={{
                     title: 'Inventario',
-                    tabBarIcon: ({ color }) => <FontAwesome name="list-alt" size={28} color={color} />,
-                }}
-            />
-
-            <Tabs.Screen
-                name="precios"
-                options={{
-                    title: 'Precios',
-                    tabBarIcon: ({ color }) => <FontAwesome name="list-alt" size={28} color={color} />,
+                    tabBarIcon: ({ color }) => <FontAwesome name="archive" size={24} color={color} />,
                 }}
             />
         </Tabs>
