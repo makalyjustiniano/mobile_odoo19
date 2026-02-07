@@ -238,7 +238,7 @@ export default function DistribucionScreen() {
                     ) : item.lines && item.lines.length > 0 ? (
                         item.lines.map(renderLine)
                     ) : (
-                        <Text style={styles.noLinesText}>Cargando líneas...</Text>
+                        <Text style={styles.noLinesText}>No hay líneas...</Text>
                     )}
                 </View>
             )}

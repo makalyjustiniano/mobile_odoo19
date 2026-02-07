@@ -8,6 +8,7 @@ export interface OdooKwargs {
   fields?: string[];
   limit?: number;
   context?: any;
+  [key: string]: any;
 }
 
 export const callOdoo = async (
