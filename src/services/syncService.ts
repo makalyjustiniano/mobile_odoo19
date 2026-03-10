@@ -375,25 +375,37 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
             if (p.sync_status === 'new') {
                 onProgress?.(`Subiendo pago: Bs. ${p.amount}`);
                 try {
-                    const response = await callOdoo('account.payment', 'create', {
-                        vals_list: [{
-                            amount: p.amount,
-                            date: p.payment_date,
-                            journal_id: p.journal_id,
-                            partner_id: p.partner_id,
-                            payment_type: 'inbound',
-                            partner_type: 'customer',
-                            ref: p.memo || `Pago desde móvil`
-                        }]
+                    // Use account.payment.register wizard to ensure reconciliation with invoice
+                    const wizContext = {
+                        active_model: 'account.move',
+                        active_ids: [p.invoice_id]
+                    };
+                    const wizVals = {
+                        amount: p.amount,
+                        payment_date: p.payment_date,
+                        journal_id: p.journal_id,
+                        communication: p.memo || `Pago desde móvil`
+                    };
+
+                    const wizRes: any = await callOdoo('account.payment.register', 'create', {
+                        vals_list: [wizVals],
+                        context: wizContext
                     });
-                    
-                    const newPaymentId = Array.isArray(response) ? (response[0].id || response[0]) : (response.id || response);
-                    
-                    if (newPaymentId) {
-                        // Post the payment
-                        await callOdoo('account.payment', 'action_post', { ids: [newPaymentId] });
+
+                    const wizId = Array.isArray(wizRes) ? (wizRes[0].id || wizRes[0]) : (wizRes.id || wizRes);
+
+                    if (wizId) {
+                        onProgress?.(`Conciliando pago con factura...`);
+                        const payRes: any = await callOdoo('account.payment.register', 'action_create_payments', {
+                            ids: [wizId],
+                            context: wizContext
+                        });
+
+                        // Extract payment ID from action response if available, else just mark p.id as synced
+                        const newPaymentId = payRes && payRes.res_id ? payRes.res_id : wizId;
+
                         await db.markSynced('account_payments', p.id, newPaymentId);
-                        console.log(`Pago ${newPaymentId} registrado con éxito.`);
+                        console.log(`Pago ${newPaymentId} registrado y conciliado con éxito.`);
                     }
                 } catch (payErr: any) {
                     console.error(`Error al subir pago: ${payErr.message}`);
