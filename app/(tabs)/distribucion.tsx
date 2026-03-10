@@ -13,6 +13,8 @@ import {
 } from 'react-native';
 import { FontAwesome } from '@expo/vector-icons';
 import { callOdoo } from '../../src/api/odooClient';
+import { useConfigStore } from '../../src/store/configStore';
+import * as db from '../../src/services/dbService';
 
 // Enable LayoutAnimation for Android
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
@@ -54,10 +56,21 @@ export default function DistribucionScreen() {
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
     const [viewMode, setViewMode] = useState<ViewMode>('client');
+    const isOffline = useConfigStore((state) => state.isOffline);
 
     const fetchMoves = async () => {
         try {
+            await db.initDB();
             setLoading(true);
+
+            if (isOffline) {
+                console.log('Fetching stock moves from SQLite...');
+                const localData = await db.getStockMoves();
+                setMoves(localData as any);
+                return;
+            }
+
+            console.log('Fetching stock moves from Odoo...');
             const result = await callOdoo('stock.move', 'search_read', {
                 domain: [['state', '=', 'assigned']],
                 fields: [
@@ -84,6 +97,7 @@ export default function DistribucionScreen() {
     };
 
     const fetchLinesForMove = async (moveId: number) => {
+        if (isOffline) return; // Lines are already loaded in getStockMoves
         try {
             setMoves(prev => prev.map(m => m.id === moveId ? { ...m, loadingLines: true } : m));
 
@@ -131,7 +145,7 @@ export default function DistribucionScreen() {
 
     useEffect(() => {
         fetchMoves();
-    }, []);
+    }, [isOffline]);
 
     const onRefresh = () => {
         setRefreshing(true);

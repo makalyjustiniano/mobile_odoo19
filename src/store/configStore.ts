@@ -11,9 +11,11 @@ interface ConnectionProfile {
 interface ConfigState {
   profiles: ConnectionProfile[];
   activeProfileId: string;
+  isOffline: boolean;
   setProfileUrl: (id: string, url: string) => void;
   setActiveProfile: (id: string) => void;
   getActiveProfile: () => ConnectionProfile | undefined;
+  toggleOffline: () => void;
 }
 
 export const useConfigStore = create<ConfigState>()(
@@ -25,12 +27,15 @@ export const useConfigStore = create<ConfigState>()(
         { id: '3', name: 'Conexión 3', url: '' },
       ],
       activeProfileId: '1',
+      isOffline: true,
 
       setProfileUrl: (id, url) => set((state) => ({
         profiles: state.profiles.map((p) => p.id === id ? { ...p, url } : p)
       })),
 
       setActiveProfile: (id) => set({ activeProfileId: id }),
+
+      toggleOffline: () => set((state) => ({ isOffline: !state.isOffline })),
 
       getActiveProfile: () => {
         const state = get();

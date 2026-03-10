@@ -1,6 +1,8 @@
-const ODOO_URL = 'https://brixy-staging-28261857.dev.odoo.com';
-const API_KEY = 'e6c0484bddd4f9354010c515c433d97503c87757';
-const DB_NAME = 'brixy-staging-28261857';
+import { useAuthStore } from '../store/authStore';
+
+const FALLBACK_ODOO_URL = 'https://brixy-staging-28261857.dev.odoo.com';
+const FALLBACK_API_KEY = 'e6c0484bddd4f9354010c515c433d97503c87757';
+const FALLBACK_DB_NAME = 'brixy-staging-28261857';
 
 export interface OdooKwargs {
   ids?: number[];
@@ -11,22 +13,41 @@ export interface OdooKwargs {
   [key: string]: any;
 }
 
+interface OdooConnection {
+  url: string;
+  apiKey: string;
+  database: string;
+}
+
+const resolveConnection = (): OdooConnection => {
+  const { user } = useAuthStore.getState();
+  return {
+    url: user?.url || FALLBACK_ODOO_URL,
+    apiKey: user?.apiKey || FALLBACK_API_KEY,
+    database: user?.database || FALLBACK_DB_NAME,
+  };
+};
+
+const buildJson2Url = (baseUrl: string, model: string, method: string) => {
+  const cleanBase = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+  return `${cleanBase}/json/2/${model}/${method}`;
+};
+
 export const callOdoo = async (
   model: string,
   method: string,
   kwargs: OdooKwargs = {}
 ) => {
-  // Construcción dinámica de la URL (sin repetir path si ya viene en ODOO_URL)
-  const baseUrl = ODOO_URL.endsWith('/') ? ODOO_URL.slice(0, -1) : ODOO_URL;
-  const url = `${baseUrl}/json/2/${model}/${method}`;
+  const connection = resolveConnection();
+  const url = buildJson2Url(connection.url, model, method);
   
   try {
     const response = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${API_KEY}`,
-        "X-Odoo-Database": DB_NAME,
+        'Authorization': `Bearer ${connection.apiKey}`,
+        "X-Odoo-Database": connection.database,
       },
       body: JSON.stringify(kwargs),
     });
@@ -38,7 +59,7 @@ export const callOdoo = async (
 
     return await response.json();
   } catch (error: any) {
-    console.error(`Odoo API Error [${model}.${method}]:`, error.message);
+    console.error(`Odoo API Error [${model}.${method}] ${url}:`, error.message);
     throw error;
   }
 };
@@ -47,13 +68,28 @@ export const callOdoo = async (
  * Initial Test function to verify connection using Fetch
  */
 export const testConnection = async (url: string, apiKey: string, database: string, username: string, password: string) => {
+  const endpoint = buildJson2Url(url, 'res.users', 'search_read');
   try {
-    // Usamos el objeto de argumentos (kwargs)
-    const contacts = await callOdoo('res.users', 'search_read', {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        "X-Odoo-Database": database,
+      },
+      body: JSON.stringify({
       domain: [["login", "=", username]],
       fields: ['display_name', 'email'],
       limit: 1,
+      }),
     });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Odoo Error ${response.status}: ${errorText}`);
+    }
+
+    const contacts = await response.json();
     console.log('¡Conexión Exitosa!', contacts);
     return contacts;
   } catch (error) {

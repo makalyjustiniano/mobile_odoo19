@@ -2,10 +2,14 @@ import { Tabs, useRouter } from 'expo-router';
 import { FontAwesome } from '@expo/vector-icons';
 import { Pressable } from 'react-native';
 import { useAuthStore } from '../../src/store/authStore';
+import { useConfigStore } from '../../src/store/configStore';
+import { View, Text } from 'react-native';
 
 export default function TabLayout() {
     const router = useRouter();
     const logout = useAuthStore((state) => state.logout);
+    const isOffline = useConfigStore((state) => state.isOffline);
+    const toggleOffline = useConfigStore((state) => state.toggleOffline);
 
     const handleLogout = () => {
         console.log('Ejecutando Logout...');
@@ -18,9 +22,39 @@ export default function TabLayout() {
         <Tabs screenOptions={{
             tabBarActiveTintColor: '#007AFF',
             headerRight: () => (
-                <Pressable onPress={handleLogout} style={{ marginRight: 15 }}>
-                    <FontAwesome name="sign-out" size={24} color="#FF3B30" />
-                </Pressable>
+                <View style={{ flexDirection: 'row', alignItems: 'center', marginRight: 15 }}>
+                    <Pressable 
+                        onPress={toggleOffline} 
+                        style={{ 
+                            flexDirection: 'row', 
+                            alignItems: 'center', 
+                            backgroundColor: isOffline ? '#F3F4F6' : '#E6F6F5',
+                            paddingHorizontal: 10,
+                            paddingVertical: 5,
+                            borderRadius: 20,
+                            marginRight: 15,
+                            borderWidth: 1,
+                            borderColor: isOffline ? '#D1D5DB' : '#00A09D'
+                        }}
+                    >
+                        <FontAwesome 
+                            name={isOffline ? "cloud-download" : "cloud"} 
+                            size={18} 
+                            color={isOffline ? "#6B7280" : "#00A09D"} 
+                        />
+                        <Text style={{ 
+                            marginLeft: 5, 
+                            fontSize: 12, 
+                            fontWeight: 'bold',
+                            color: isOffline ? "#6B7280" : "#00A09D"
+                        }}>
+                            {isOffline ? 'OFFLINE' : 'ONLINE'}
+                        </Text>
+                    </Pressable>
+                    <Pressable onPress={handleLogout}>
+                        <FontAwesome name="sign-out" size={24} color="#FF3B30" />
+                    </Pressable>
+                </View>
             ),
         }}>
             <Tabs.Screen

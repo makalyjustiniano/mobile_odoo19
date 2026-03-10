@@ -16,6 +16,8 @@ import {
 } from 'react-native';
 import { FontAwesome } from '@expo/vector-icons';
 import { callOdoo } from '../../src/api/odooClient';
+import { useConfigStore } from '../../src/store/configStore';
+import * as db from '../../src/services/dbService';
 
 interface SaleOrderLine {
     id: number;
@@ -34,6 +36,7 @@ interface SaleOrder {
     state: string;
     amount_total: number;
     order_line: number[];
+    invoice_id?: number | null;
     lines_data?: SaleOrderLine[];
 }
 
@@ -55,11 +58,28 @@ interface NewLine {
     price: number;
 }
 
+interface Invoice {
+    id: number;
+    name: string;
+    partner_name: string;
+    invoice_date: string;
+    amount_total: number;
+    amount_residual: number;
+    lines?: any[];
+}
+
 export default function VentasScreen() {
     const [result, setResult] = useState<SaleOrder[]>([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
     const [modalVisible, setModalVisible] = useState(false);
+    
+    // Invoice Modal State
+    const [invoiceModalVisible, setInvoiceModalVisible] = useState(false);
+    const [selectedInvoice, setSelectedInvoice] = useState<Invoice | null>(null);
+    const [loadingInvoice, setLoadingInvoice] = useState(false);
+
+    const isOffline = useConfigStore((state) => state.isOffline);
 
     // Form state
     const [selectedPartner, setSelectedPartner] = useState<Partner | null>(null);
@@ -76,13 +96,23 @@ export default function VentasScreen() {
 
     useEffect(() => {
         fetchData();
-    }, []);
+    }, [isOffline]);
 
     const fetchData = async () => {
         try {
+            await db.initDB();
             if (!refreshing) setLoading(true);
+
+            if (isOffline) {
+                console.log('Fetching sales from SQLite...');
+                const localOrders = await db.getSaleOrders();
+                setResult(localOrders as any);
+                return;
+            }
+
+            console.log('Fetching sales from Odoo...');
             const orders: SaleOrder[] = await callOdoo('sale.order', 'search_read', {
-                fields: ["name", "display_name", "partner_id", "date_order", "state", "amount_total", "order_line"],
+                fields: ["name", "display_name", "partner_id", "date_order", "state", "amount_total", "order_line", "invoice_ids"],
                 limit: 20
             });
 
@@ -94,13 +124,17 @@ export default function VentasScreen() {
                     fields: ["product_id", "product_uom_qty", "price_unit", "price_subtotal"]
                 });
 
-                const ordersWithLines = orders.map(order => ({
-                    ...order,
-                    lines_data: lines.filter(line => order.order_line.includes(line.id))
-                }));
+                const ordersWithLines = orders.map(order => {
+                    const o: any = order;
+                    return {
+                        ...order,
+                        invoice_id: Array.isArray(o.invoice_ids) && o.invoice_ids.length > 0 ? o.invoice_ids[0] : null,
+                        lines_data: lines.filter(line => order.order_line.includes(line.id))
+                    };
+                });
                 setResult(ordersWithLines);
             } else {
-                setResult(orders);
+                setResult(orders.map(o => ({ ...o, invoice_id: (o as any).invoice_ids?.[0] || null })));
             }
         } catch (error) {
             console.error("Error al cargar ventas:", error);
@@ -124,6 +158,13 @@ export default function VentasScreen() {
             return;
         }
         try {
+            if (isOffline) {
+                const results = await db.searchPartners(query);
+                setPartners(results as any);
+                setShowPartnerResults(true);
+                return;
+            }
+
             const results = await callOdoo('res.partner', 'search_read', {
                 domain: [['name', 'ilike', query], ['customer_rank', '>', 0]],
                 fields: ['display_name'],
@@ -145,6 +186,13 @@ export default function VentasScreen() {
             return;
         }
         try {
+            if (isOffline) {
+                const results = await db.searchProducts(query);
+                setProducts(results as any);
+                setShowProductResults(true);
+                return;
+            }
+
             const results = await callOdoo('product.product', 'search_read', {
                 domain: [['name', 'ilike', query], ['sale_ok', '=', true]],
                 fields: ['display_name', 'list_price'],
@@ -202,14 +250,31 @@ export default function VentasScreen() {
         try {
             setLoading(true);
 
-            // Format lines for Odoo (Command 0, 0, values)
+            if (isOffline) {
+                const localOrder = {
+                    partner_name: selectedPartner.display_name,
+                    date_order: new Date().toISOString().replace('T', ' ').substring(0, 19),
+                    amount_total: quoteLines.reduce((acc, l) => acc + (l.price * l.quantity), 0)
+                };
+                
+                await db.createSaleOrderLocal(localOrder, quoteLines);
+                
+                setModalVisible(false);
+                Alert.alert('Modo Offline', 'Cotización guardada localmente.');
+                
+                setSelectedPartner(null);
+                setPartnerSearch('');
+                setQuoteLines([]);
+                fetchData();
+                return;
+            }
+
             const lines = quoteLines.map(line => [0, 0, {
                 product_id: line.product_id,
                 product_uom_qty: line.quantity,
                 price_unit: line.price
             }]);
 
-            // Prepare data following Odoo 19 REST API pattern
             const vals = {
                 partner_id: selectedPartner.id,
                 order_line: lines,
@@ -217,34 +282,20 @@ export default function VentasScreen() {
                 state: 'draft',
             };
 
-            const response = await callOdoo('sale.order', 'create', {
+            await callOdoo('sale.order', 'create', {
                 vals_list: [vals]
             });
 
-            // Extraction logic for ID
-            let newOrderId = null;
-            if (Array.isArray(response) && response.length > 0) {
-                newOrderId = response[0].id || response[0];
-            } else if (response && typeof response === 'object') {
-                newOrderId = response.id || response;
-            } else {
-                newOrderId = response;
-            }
-
             setModalVisible(false);
-            Alert.alert('Éxito', `Cotización creada correctamente. ID: ${JSON.stringify(newOrderId)}`);
+            Alert.alert('Éxito', `Cotización creada correctamente en Odoo.`);
 
-            // Reset form
             setSelectedPartner(null);
             setPartnerSearch('');
             setQuoteLines([]);
             fetchData();
         } catch (error: any) {
             console.error('Error creating quotation:', error);
-            Alert.alert(
-                'Error al registrar',
-                `Odoo respondió: ${error.message || 'Error desconocido'}`
-            );
+            Alert.alert('Error', `Odoo respondió: ${error.message}`);
         } finally {
             setLoading(false);
         }
@@ -266,6 +317,105 @@ export default function VentasScreen() {
         }
     };
 
+    const handleCreateInvoice = async (orderId: number) => {
+        try {
+            setLoading(true);
+            if (isOffline) {
+                await db.createInvoiceLocal(orderId);
+                Alert.alert('Éxito', 'Factura generada localmente. Podrá visualizarla abajo.');
+                fetchData();
+                return;
+            }
+
+            // Online invoicing: Manual creation with linking
+            const orderOdoo = await callOdoo('sale.order', 'search_read', {
+                domain: [['id', '=', orderId]],
+                fields: ['state', 'name', 'partner_id', 'order_line']
+            });
+            
+            if (orderOdoo.length > 0) {
+                const order = orderOdoo[0];
+                if (['draft', 'sent'].includes(order.state)) {
+                    await callOdoo('sale.order', 'action_confirm', { ids: [orderId] }); 
+                }
+
+                // Fetch SO lines for linking
+                const soLines = await callOdoo('sale.order.line', 'search_read', {
+                    domain: [['order_id', '=', orderId]],
+                    fields: ['id', 'product_id', 'name', 'product_uom_qty', 'price_unit']
+                });
+
+                const invoiceLinesOdoo = soLines.map((sol: any) => [0, 0, {
+                    name: sol.name,
+                    quantity: sol.product_uom_qty,
+                    price_unit: sol.price_unit,
+                    sale_line_ids: [[4, sol.id]]
+                }]);
+
+                const invoiceVals = {
+                    move_type: 'out_invoice',
+                    partner_id: order.partner_id[0],
+                    invoice_date: new Date().toISOString().split('T')[0],
+                    invoice_line_ids: invoiceLinesOdoo,
+                    invoice_origin: order.name,
+                };
+
+                const invResponse = await callOdoo('account.move', 'create', { vals_list: [invoiceVals] });
+                const newInvId = Array.isArray(invResponse) ? (invResponse[0].id || invResponse[0]) : (invResponse.id || invResponse);
+
+                if (newInvId) {
+                    await callOdoo('account.move', 'action_post', { ids: [newInvId] });
+                    Alert.alert('Éxito', 'Factura generada y publicada en Odoo.');
+                }
+            }
+            fetchData();
+        } catch (error: any) {
+            console.error('Error creating invoice:', error);
+            Alert.alert('Error', `No se pudo facturar: ${error.message}`);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const viewInvoiceDetail = async (invoiceId: number) => {
+        try {
+            setLoadingInvoice(true);
+            setInvoiceModalVisible(true);
+            
+            if (isOffline) {
+                const dbInst = await db.getDb();
+                const inv: any = await dbInst.getFirstAsync('SELECT * FROM account_moves WHERE id = ?', [invoiceId]);
+                if (inv) {
+                    const lines = await dbInst.getAllAsync('SELECT * FROM account_move_lines WHERE move_id = ?', [invoiceId]);
+                    setSelectedInvoice({ ...inv, lines });
+                }
+                return;
+            }
+
+            const invData = await callOdoo('account.move', 'search_read', {
+                domain: [['id', '=', invoiceId]],
+                fields: ['name', 'partner_id', 'invoice_date', 'amount_total', 'amount_residual', 'invoice_line_ids']
+            });
+
+            if (invData.length > 0) {
+                const inv = invData[0];
+                const lines = await callOdoo('account.move.line', 'search_read', {
+                    domain: [['move_id', '=', invoiceId], ['display_type', 'not in', ['line_section', 'line_note']]],
+                    fields: ['name', 'quantity', 'price_unit', 'price_subtotal']
+                });
+                setSelectedInvoice({
+                    ...inv,
+                    partner_name: inv.partner_id[1],
+                    lines
+                });
+            }
+        } catch (error) {
+            console.error('Error fetching invoice details:', error);
+        } finally {
+            setLoadingInvoice(false);
+        }
+    };
+
     const renderCard = ({ item }: { item: SaleOrder }) => (
         <View style={styles.card}>
             <View style={styles.cardHeader}>
@@ -281,7 +431,7 @@ export default function VentasScreen() {
                 <View style={styles.infoRow}>
                     <FontAwesome name="user" size={14} color="#6B7280" />
                     <Text style={styles.partnerName}>
-                        {Array.isArray(item.partner_id) ? item.partner_id[1] : 'Individual'}
+                        {Array.isArray(item.partner_id) ? item.partner_id[1] : (item as any).partner_name || 'Individual'}
                     </Text>
                 </View>
                 <View style={styles.infoRow}>
@@ -294,7 +444,7 @@ export default function VentasScreen() {
                 {item.lines_data?.map((line, idx) => (
                     <View key={idx} style={styles.linePreview}>
                         <Text style={styles.lineText} numberOfLines={1}>
-                            • {line.product_id[1]} (x{line.product_uom_qty})
+                            • {Array.isArray(line.product_id) ? line.product_id[1] : (line as any).product_name} (x{line.product_uom_qty})
                         </Text>
                     </View>
                 ))}
@@ -304,15 +454,38 @@ export default function VentasScreen() {
                         <Text style={styles.totalLabel}>TOTAL</Text>
                         <Text style={styles.totalValue}>Bs. {item.amount_total.toFixed(2)}</Text>
                     </View>
-                    {(item.state === 'draft' || item.state === 'sent') && (
-                        <TouchableOpacity
-                            style={styles.confirmInlineButton}
-                            onPress={() => confirmExistingOrder(item.id)}
-                        >
-                            <FontAwesome name="check-circle" size={14} color="#fff" />
-                            <Text style={styles.confirmInlineText}>CONFIRMAR</Text>
-                        </TouchableOpacity>
-                    )}
+                    
+                    <View style={styles.actionRow}>
+                        {(item.state === 'draft' || item.state === 'sent') && (
+                            <TouchableOpacity
+                                style={styles.confirmInlineButton}
+                                onPress={() => confirmExistingOrder(item.id)}
+                            >
+                                <FontAwesome name="check-circle" size={14} color="#fff" />
+                                <Text style={styles.confirmInlineText}>CONFIRMAR</Text>
+                            </TouchableOpacity>
+                        )}
+
+                        {item.state === 'sale' && !item.invoice_id && (
+                            <TouchableOpacity
+                                style={styles.invoiceButton}
+                                onPress={() => handleCreateInvoice(item.id)}
+                            >
+                                <FontAwesome name="file-text" size={14} color="#fff" />
+                                <Text style={styles.actionText}>FACTURAR</Text>
+                            </TouchableOpacity>
+                        )}
+
+                        {item.invoice_id && (
+                            <TouchableOpacity
+                                style={styles.viewInvoiceButton}
+                                onPress={() => viewInvoiceDetail(item.invoice_id!)}
+                            >
+                                <FontAwesome name="eye" size={14} color="#714B67" />
+                                <Text style={[styles.actionText, { color: '#714B67' }]}>VER FACTURA</Text>
+                            </TouchableOpacity>
+                        )}
+                    </View>
                 </View>
             </View>
         </View>
@@ -347,6 +520,7 @@ export default function VentasScreen() {
                 }
             />
 
+            {/* Create Quote Modal */}
             <Modal
                 animationType="slide"
                 transparent={true}
@@ -366,7 +540,6 @@ export default function VentasScreen() {
                         </View>
 
                         <ScrollView style={styles.modalBody} keyboardShouldPersistTaps="handled">
-                            {/* Partner Selection */}
                             <Text style={styles.inputLabel}>Cliente</Text>
                             {selectedPartner ? (
                                 <View style={styles.selectedItem}>
@@ -402,7 +575,6 @@ export default function VentasScreen() {
                                 </View>
                             )}
 
-                            {/* Product Selection */}
                             <Text style={[styles.inputLabel, { marginTop: 20 }]}>Agregar Productos</Text>
                             <View style={styles.searchWrapper}>
                                 <TextInput
@@ -429,7 +601,6 @@ export default function VentasScreen() {
                                 )}
                             </View>
 
-                            {/* Quote Lines */}
                             <Text style={[styles.inputLabel, { marginTop: 20 }]}>Productos Seleccionados</Text>
                             {quoteLines.length === 0 ? (
                                 <Text style={styles.placeholderText}>No se han agregado productos aún.</Text>
@@ -456,7 +627,6 @@ export default function VentasScreen() {
                                 ))
                             )}
 
-                            {/* Confirmation Toggle */}
                             <View style={styles.toggleRow}>
                                 <Text style={styles.inputLabel}>¿Confirmar Orden Automáticamente?</Text>
                                 <TouchableOpacity
@@ -486,6 +656,73 @@ export default function VentasScreen() {
                         </View>
                     </View>
                 </KeyboardAvoidingView>
+            </Modal>
+
+            {/* Invoice Detail Modal */}
+            <Modal
+                animationType="fade"
+                transparent={true}
+                visible={invoiceModalVisible}
+                onRequestClose={() => setInvoiceModalVisible(false)}
+            >
+                <View style={styles.invoiceModalOverlay}>
+                    <View style={styles.invoiceModalContent}>
+                        <View style={styles.modalHeader}>
+                            <Text style={styles.modalTitle}>Detalle de Factura</Text>
+                            <TouchableOpacity onPress={() => setInvoiceModalVisible(false)}>
+                                <FontAwesome name="times" size={24} color="#6B7280" />
+                            </TouchableOpacity>
+                        </View>
+
+                        {loadingInvoice ? (
+                            <ActivityIndicator size="large" color="#714B67" style={{ padding: 40 }} />
+                        ) : selectedInvoice ? (
+                            <ScrollView style={styles.modalBody}>
+                                <View style={styles.invoiceHeaderInfo}>
+                                    <Text style={styles.invNumber}>{selectedInvoice.name}</Text>
+                                    <Text style={styles.invPartner}>{selectedInvoice.partner_name}</Text>
+                                    <Text style={styles.invDate}>Fecha: {selectedInvoice.invoice_date}</Text>
+                                </View>
+
+                                <View style={styles.divider} />
+
+                                {selectedInvoice.lines?.map((line: any, idx: number) => (
+                                    <View key={idx} style={styles.invLine}>
+                                        <View style={{ flex: 2 }}>
+                                            <Text style={styles.invLineName}>{line.name || line.product_name}</Text>
+                                            <Text style={styles.invLineQty}>Cant: {line.quantity}</Text>
+                                        </View>
+                                        <Text style={styles.invLineSubtotal}>Bs. {line.price_subtotal?.toFixed(2) || (line.quantity * line.price_unit).toFixed(2)}</Text>
+                                    </View>
+                                ))}
+
+                                <View style={styles.invFooter}>
+                                    <View style={styles.invTotalRow}>
+                                        <Text style={styles.invTotalLabel}>TOTAL</Text>
+                                        <Text style={styles.invTotalValue}>Bs. {selectedInvoice.amount_total.toFixed(2)}</Text>
+                                    </View>
+                                    <View style={styles.invTotalRow}>
+                                        <Text style={styles.invResidualLabel}>PENDIENTE</Text>
+                                        <Text style={styles.invResidualValue}>Bs. {selectedInvoice.amount_residual.toFixed(2)}</Text>
+                                    </View>
+                                </View>
+                                <View style={{ height: 40 }} />
+                            </ScrollView>
+                        ) : (
+                            <Text style={{ padding: 20 }}>No se pudo cargar la información.</Text>
+                        )}
+                        
+                        <View style={styles.modalFooter}>
+                             <TouchableOpacity
+                                style={styles.printButton}
+                                onPress={() => Alert.alert('Imprimir', 'Funcionalidad de impresión en desarrollo')}
+                            >
+                                <FontAwesome name="print" size={16} color="#fff" />
+                                <Text style={styles.saveButtonText}>IMPRIMIR FACTURA</Text>
+                             </TouchableOpacity>
+                        </View>
+                    </View>
+                </View>
             </Modal>
         </View>
     );
@@ -609,6 +846,9 @@ const styles = StyleSheet.create({
         fontWeight: 'bold',
         color: '#714B67',
     },
+    actionRow: {
+        flexDirection: 'row',
+    },
     confirmInlineButton: {
         backgroundColor: '#22C55E',
         flexDirection: 'row',
@@ -616,8 +856,35 @@ const styles = StyleSheet.create({
         paddingHorizontal: 12,
         paddingVertical: 8,
         borderRadius: 6,
+        marginLeft: 8,
     },
     confirmInlineText: {
+        color: '#fff',
+        fontSize: 11,
+        fontWeight: 'bold',
+        marginLeft: 5,
+    },
+    invoiceButton: {
+        backgroundColor: '#3B82F6',
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingHorizontal: 12,
+        paddingVertical: 8,
+        borderRadius: 6,
+        marginLeft: 8,
+    },
+    viewInvoiceButton: {
+        backgroundColor: '#F3E8FF',
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingHorizontal: 12,
+        paddingVertical: 8,
+        borderRadius: 6,
+        marginLeft: 8,
+        borderWidth: 1,
+        borderColor: '#C084FC',
+    },
+    actionText: {
         color: '#fff',
         fontSize: 11,
         fontWeight: 'bold',
@@ -633,6 +900,20 @@ const styles = StyleSheet.create({
         height: '92%',
         borderTopLeftRadius: 20,
         borderTopRightRadius: 20,
+        overflow: 'hidden',
+    },
+    invoiceModalOverlay: {
+        flex: 1,
+        backgroundColor: 'rgba(0,0,0,0.7)',
+        justifyContent: 'center',
+        alignItems: 'center',
+        padding: 20,
+    },
+    invoiceModalContent: {
+        backgroundColor: '#fff',
+        width: '100%',
+        maxHeight: '80%',
+        borderRadius: 15,
         overflow: 'hidden',
     },
     modalHeader: {
@@ -752,7 +1033,7 @@ const styles = StyleSheet.create({
         marginLeft: 10,
     },
     qtyText: {
-        fontSize: 18,
+        fontSize: 16,
         fontWeight: 'bold',
         marginHorizontal: 12,
         minWidth: 20,
@@ -765,40 +1046,109 @@ const styles = StyleSheet.create({
         backgroundColor: '#F9FAFB',
     },
     modalTotal: {
-        fontSize: 22,
-        fontWeight: 'bold',
+        fontSize: 14,
+        color: '#6B7280',
+        marginBottom: 10,
         textAlign: 'right',
-        color: '#714B67',
-        marginBottom: 15,
     },
     saveButton: {
-        backgroundColor: '#00A09D',
-        height: 55,
-        borderRadius: 12,
-        justifyContent: 'center',
+        paddingVertical: 15,
+        borderRadius: 10,
         alignItems: 'center',
+    },
+    printButton: {
+        backgroundColor: '#714B67',
+        paddingVertical: 15,
+        borderRadius: 10,
+        alignItems: 'center',
+        flexDirection: 'row',
+        justifyContent: 'center',
     },
     saveButtonText: {
         color: '#fff',
-        fontSize: 16,
         fontWeight: 'bold',
-    },
-    centerContainer: {
-        flex: 1,
-        justifyContent: 'center',
-        alignItems: 'center',
-    },
-    loadingText: {
-        marginTop: 10,
-        color: '#6B7280',
+        fontSize: 14,
+        marginLeft: 10,
     },
     emptyContainer: {
+        padding: 40,
         alignItems: 'center',
-        marginTop: 100,
+        justifyContent: 'center',
+        marginTop: 50,
     },
     emptyText: {
-        marginTop: 15,
+        marginTop: 20,
         fontSize: 16,
+        color: '#9CA3AF',
+        textAlign: 'center',
+    },
+    invoiceHeaderInfo: {
+        marginBottom: 15,
+    },
+    invNumber: {
+        fontSize: 22,
+        fontWeight: 'bold',
+        color: '#111827',
+    },
+    invPartner: {
+        fontSize: 16,
+        color: '#374151',
+        marginTop: 5,
+    },
+    invDate: {
+        fontSize: 14,
+        color: '#6B7280',
+        marginTop: 5,
+    },
+    invLine: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        paddingVertical: 10,
+        borderBottomWidth: 1,
+        borderBottomColor: '#F3F4F6',
+    },
+    invLineName: {
+        fontSize: 14,
+        color: '#111827',
+        fontWeight: '500',
+    },
+    invLineQty: {
+        fontSize: 12,
         color: '#6B7280',
     },
+    invLineSubtotal: {
+        fontSize: 14,
+        fontWeight: 'bold',
+        color: '#374151',
+    },
+    invFooter: {
+        marginTop: 20,
+        backgroundColor: '#F9FAFB',
+        padding: 15,
+        borderRadius: 8,
+    },
+    invTotalRow: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        marginBottom: 8,
+    },
+    invTotalLabel: {
+        fontSize: 14,
+        fontWeight: 'bold',
+        color: '#111827',
+    },
+    invTotalValue: {
+        fontSize: 18,
+        fontWeight: 'bold',
+        color: '#714B67',
+    },
+    invResidualLabel: {
+        fontSize: 12,
+        color: '#EF4444',
+    },
+    invResidualValue: {
+        fontSize: 14,
+        fontWeight: 'bold',
+        color: '#EF4444',
+    }
 });

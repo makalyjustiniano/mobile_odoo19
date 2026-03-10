@@ -9,10 +9,16 @@ import {
     RefreshControl,
     LayoutAnimation,
     Platform,
-    UIManager
+    UIManager,
+    Modal,
+    TextInput,
+    Alert,
+    ScrollView
 } from 'react-native';
 import { FontAwesome } from '@expo/vector-icons';
 import { callOdoo } from '../../src/api/odooClient';
+import { useConfigStore } from '../../src/store/configStore';
+import * as db from '../../src/services/dbService';
 
 // Enable LayoutAnimation for Android
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
@@ -50,10 +56,29 @@ export default function CobranzasScreen() {
     const [invoices, setInvoices] = useState<AccountMove[]>([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
+    const [journals, setJournals] = useState<any[]>([]);
+    const [paymentModalVisible, setPaymentModalVisible] = useState(false);
+    const [selectedInvoice, setSelectedInvoice] = useState<AccountMove | null>(null);
+    const [paymentAmount, setPaymentAmount] = useState('');
+    const [selectedJournal, setSelectedJournal] = useState<number | null>(null);
+    const [paymentMemo, setPaymentMemo] = useState('');
+    const [submittingPayment, setSubmittingPayment] = useState(false);
+
+    const isOffline = useConfigStore((state) => state.isOffline);
 
     const fetchInvoices = async () => {
         try {
+            await db.initDB();
             setLoading(true);
+
+            if (isOffline) {
+                console.log('Fetching invoices from SQLite...');
+                const localData = await db.getAccountMoves();
+                setInvoices(localData as any);
+                return;
+            }
+
+            console.log('Fetching invoices from Odoo...');
             const result = await callOdoo('account.move', 'search_read', {
                 domain: [
                     ['move_type', '=', 'out_invoice'],
@@ -80,7 +105,73 @@ export default function CobranzasScreen() {
         }
     };
 
+    const fetchJournals = async () => {
+        try {
+            const data: any = await db.getJournals();
+            if (data && data.length > 0) {
+                setJournals(data);
+                setSelectedJournal(data[0].id);
+            }
+        } catch (error) {
+            console.error('Error fetching journals:', error);
+        }
+    };
+
+    const openPaymentModal = (invoice: AccountMove) => {
+        setSelectedInvoice(invoice);
+        setPaymentAmount(invoice.amount_residual.toString());
+        setPaymentMemo(`Pago de ${invoice.name}`);
+        setPaymentModalVisible(true);
+    };
+
+    const handleRegisterPayment = async () => {
+        if (!selectedInvoice || !selectedJournal || !paymentAmount) {
+            Alert.alert('Error', 'Por favor complete todos los campos');
+            return;
+        }
+
+        const amountNum = parseFloat(paymentAmount);
+        if (isNaN(amountNum) || amountNum <= 0) {
+            Alert.alert('Error', 'Monto inválido');
+            return;
+        }
+
+        if (amountNum > selectedInvoice.amount_residual + 0.01) {
+            Alert.alert('Error', 'El monto no puede superar el saldo pendiente');
+            return;
+        }
+
+        try {
+            setSubmittingPayment(true);
+            
+            if (!isOffline) {
+                // Online registration via Odoo wizard or action
+                // For simplicity in this first version, we'll use the same local structure and sync it
+                // OR we could call Odoo directly. Let's do local + sync trigger for consistency.
+            }
+
+            await db.saveLocalPayment({
+                amount: amountNum,
+                payment_date: new Date().toISOString().split('T')[0],
+                journal_id: selectedJournal,
+                partner_id: (selectedInvoice.partner_id as any)[0],
+                invoice_id: selectedInvoice.id,
+                memo: paymentMemo
+            });
+
+            setPaymentModalVisible(false);
+            Alert.alert('Éxito', 'Pago registrado localmente. Pendiente de sincronización.');
+            fetchInvoices();
+        } catch (error: any) {
+            console.error('Error registering payment:', error);
+            Alert.alert('Error', 'No se pudo registrar el pago: ' + error.message);
+        } finally {
+            setSubmittingPayment(false);
+        }
+    };
+
     const fetchInvoiceLines = async (moveId: number) => {
+        if (isOffline) return; // Lines are already loaded in getAccountMoves
         try {
             setInvoices(prev => prev.map(m => m.id === moveId ? { ...m, loadingLines: true } : m));
 
@@ -132,7 +223,8 @@ export default function CobranzasScreen() {
 
     useEffect(() => {
         fetchInvoices();
-    }, []);
+        fetchJournals();
+    }, [isOffline]);
 
     const onRefresh = () => {
         setRefreshing(true);
@@ -214,6 +306,16 @@ export default function CobranzasScreen() {
                     ) : (
                         <Text style={styles.noLinesText}>Cargando detalle...</Text>
                     )}
+
+                    <View style={styles.actionContainer}>
+                        <TouchableOpacity 
+                            style={styles.payButton}
+                            onPress={() => openPaymentModal(item)}
+                        >
+                            <FontAwesome name="money" size={16} color="#fff" />
+                            <Text style={styles.payButtonText}>Registrar Pago</Text>
+                        </TouchableOpacity>
+                    </View>
                 </View>
             )}
         </View>
@@ -258,6 +360,85 @@ export default function CobranzasScreen() {
                     </View>
                 }
             />
+
+            {/* Payment Modal */}
+            <Modal
+                visible={paymentModalVisible}
+                animationType="slide"
+                transparent={true}
+                onRequestClose={() => setPaymentModalVisible(false)}
+            >
+                <View style={styles.modalOverlay}>
+                    <View style={styles.modalContent}>
+                        <View style={styles.modalHeader}>
+                            <Text style={styles.modalTitle}>Registrar Pago</Text>
+                            <TouchableOpacity onPress={() => setPaymentModalVisible(false)}>
+                                <FontAwesome name="times" size={20} color="#6B7280" />
+                            </TouchableOpacity>
+                        </View>
+
+                        <ScrollView style={styles.modalForm}>
+                            <Text style={styles.invoiceRef}>Factura: {selectedInvoice?.name}</Text>
+                            
+                            <Text style={styles.inputLabel}>Monto a Cobrar (Bs.)</Text>
+                            <TextInput
+                                style={styles.input}
+                                value={paymentAmount}
+                                onChangeText={setPaymentAmount}
+                                keyboardType="numeric"
+                                placeholder="0.00"
+                            />
+
+                            <Text style={styles.inputLabel}>Método de Pago</Text>
+                            <View style={styles.journalsContainer}>
+                                {journals.map((j: any) => (
+                                    <TouchableOpacity 
+                                        key={j.id}
+                                        style={[
+                                            styles.journalOption, 
+                                            selectedJournal === j.id && styles.journalSelected
+                                        ]}
+                                        onPress={() => setSelectedJournal(j.id)}
+                                    >
+                                        <FontAwesome 
+                                            name={j.type === 'bank' ? 'bank' : 'money'} 
+                                            size={14} 
+                                            color={selectedJournal === j.id ? '#fff' : '#714B67'} 
+                                        />
+                                        <Text style={[
+                                            styles.journalText,
+                                            selectedJournal === j.id && styles.journalTextSelected
+                                        ]}>{j.name}</Text>
+                                    </TouchableOpacity>
+                                ))}
+                            </View>
+
+                            <Text style={styles.inputLabel}>Nota / Referencia</Text>
+                            <TextInput
+                                style={[styles.input, { height: 80, textAlignVertical: 'top' }]}
+                                value={paymentMemo}
+                                onChangeText={setPaymentMemo}
+                                multiline={true}
+                                placeholder="Ej: Pago en efectivo recibo #123"
+                            />
+
+                            <TouchableOpacity 
+                                style={[styles.submitButton, submittingPayment && styles.buttonDisabled]}
+                                onPress={handleRegisterPayment}
+                                disabled={submittingPayment}
+                            >
+                                {submittingPayment ? (
+                                    <ActivityIndicator color="#fff" />
+                                ) : (
+                                    <Text style={styles.submitButtonText}>Confirmar Cobro</Text>
+                                )}
+                            </TouchableOpacity>
+                            
+                            <View style={{ height: 20 }} />
+                        </ScrollView>
+                    </View>
+                </View>
+            </Modal>
         </View>
     );
 }
@@ -474,5 +655,119 @@ const styles = StyleSheet.create({
         marginTop: 15,
         fontSize: 16,
         color: '#9CA3AF',
+    },
+    actionContainer: {
+        marginTop: 15,
+        borderTopWidth: 1,
+        borderTopColor: '#E5E7EB',
+        paddingTop: 15,
+        alignItems: 'flex-end',
+    },
+    payButton: {
+        backgroundColor: '#714B67',
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingHorizontal: 20,
+        paddingVertical: 10,
+        borderRadius: 10,
+    },
+    payButtonText: {
+        color: '#fff',
+        fontWeight: 'bold',
+        marginLeft: 8,
+    },
+    modalOverlay: {
+        flex: 1,
+        backgroundColor: 'rgba(0,0,0,0.5)',
+        justifyContent: 'flex-end',
+    },
+    modalContent: {
+        backgroundColor: '#fff',
+        borderTopLeftRadius: 25,
+        borderTopRightRadius: 25,
+        height: '80%',
+        padding: 20,
+    },
+    modalHeader: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        marginBottom: 20,
+    },
+    modalTitle: {
+        fontSize: 20,
+        fontWeight: 'bold',
+        color: '#111827',
+    },
+    modalForm: {
+        flex: 1,
+    },
+    invoiceRef: {
+        fontSize: 14,
+        color: '#714B67',
+        fontWeight: 'bold',
+        marginBottom: 20,
+        backgroundColor: '#F3F4FB',
+        padding: 10,
+        borderRadius: 8,
+    },
+    inputLabel: {
+        fontSize: 14,
+        fontWeight: '600',
+        color: '#374151',
+        marginBottom: 8,
+    },
+    input: {
+        backgroundColor: '#F9FAFB',
+        borderWidth: 1,
+        borderColor: '#E5E7EB',
+        borderRadius: 10,
+        padding: 12,
+        fontSize: 16,
+        color: '#111827',
+        marginBottom: 20,
+    },
+    journalsContainer: {
+        flexDirection: 'row',
+        flexWrap: 'wrap',
+        marginBottom: 20,
+    },
+    journalOption: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: '#F3F4FB',
+        paddingHorizontal: 15,
+        paddingVertical: 10,
+        borderRadius: 20,
+        marginRight: 10,
+        marginBottom: 10,
+        borderWidth: 1,
+        borderColor: '#714B67',
+    },
+    journalSelected: {
+        backgroundColor: '#714B67',
+    },
+    journalText: {
+        color: '#714B67',
+        marginLeft: 6,
+        fontWeight: '600',
+    },
+    journalTextSelected: {
+        color: '#fff',
+    },
+    submitButton: {
+        backgroundColor: '#00A09D',
+        padding: 15,
+        borderRadius: 12,
+        alignItems: 'center',
+        marginTop: 10,
+    },
+    buttonDisabled: {
+        opacity: 0.6,
+    },
+    submitButtonText: {
+        color: '#fff',
+        fontSize: 16,
+        fontWeight: 'bold',
     },
 });

@@ -27,7 +27,7 @@ export const usePartnerStore = create<PartnerState>((set) => ({
   fetchPartners: async () => {
     set({ loading: true, error: null });
     try {
-      const data = await callOdoo('res.partner', 'search_read', [], {
+      const data = await callOdoo('res.partner', 'search_read', {
         fields: ['name', 'email', 'phone', 'city'],
         limit: 100,
       });
