@@ -144,23 +144,62 @@ export default function CobranzasScreen() {
         try {
             setSubmittingPayment(true);
             
+            let syncStatus: 'new' | 'synced' = 'new';
+            let odooPaymentId: number | null = null;
+
             if (!isOffline) {
-                // Online registration via Odoo wizard or action
-                // For simplicity in this first version, we'll use the same local structure and sync it
-                // OR we could call Odoo directly. Let's do local + sync trigger for consistency.
+                // Online registration via Odoo wizard to ensure reconciliation
+                try {
+                    const wizContext = {
+                        active_model: 'account.move',
+                        active_ids: [selectedInvoice.id]
+                    };
+                    const wizVals = {
+                        amount: amountNum,
+                        payment_date: new Date().toISOString().split('T')[0],
+                        journal_id: selectedJournal,
+                        communication: paymentMemo || `Pago desde móvil`
+                    };
+
+                    const wizRes: any = await callOdoo('account.payment.register', 'create', {
+                        vals_list: [wizVals],
+                        context: wizContext
+                    });
+
+                    const wizId = Array.isArray(wizRes) ? (wizRes[0].id || wizRes[0]) : (wizRes.id || wizRes);
+
+                    if (wizId) {
+                        const payRes: any = await callOdoo('account.payment.register', 'action_create_payments', {
+                            ids: [wizId],
+                            context: wizContext
+                        });
+                        odooPaymentId = payRes && payRes.res_id ? payRes.res_id : wizId;
+                        syncStatus = 'synced';
+                    }
+                } catch (onlineErr: any) {
+                    console.error('Error in online payment registration:', onlineErr);
+                    // Fallback to local only if online fails (app will sync later)
+                    Alert.alert('Aviso', 'No se pudo registrar en Odoo, se guardará localmente para sincronizar luego.');
+                }
             }
 
             await db.saveLocalPayment({
+                id: odooPaymentId, // If syncStatus is 'synced', we use this ID
                 amount: amountNum,
                 payment_date: new Date().toISOString().split('T')[0],
                 journal_id: selectedJournal,
                 partner_id: (selectedInvoice.partner_id as any)[0],
                 invoice_id: selectedInvoice.id,
-                memo: paymentMemo
+                memo: paymentMemo,
+                sync_status: syncStatus
             });
 
             setPaymentModalVisible(false);
-            Alert.alert('Éxito', 'Pago registrado localmente. Pendiente de sincronización.');
+            if (syncStatus === 'synced') {
+                Alert.alert('Éxito', 'Pago registrado y conciliado en Odoo.');
+            } else {
+                Alert.alert('Éxito', 'Pago registrado localmente. Pendiente de sincronización.');
+            }
             fetchInvoices();
         } catch (error: any) {
             console.error('Error registering payment:', error);

@@ -578,10 +578,13 @@ export const getJournals = async () => {
 // Payments
 export const saveLocalPayment = async (payment: any) => {
     const db = await getDb();
-    const localId = -Math.floor(Date.now() / 1000);
+    const localId = payment.id || -Math.floor(Date.now() / 1000);
+    const syncStatus = payment.sync_status || 'new';
+    const isLocal = syncStatus === 'synced' ? 0 : 1;
+
     await db.runAsync(
         `INSERT INTO account_payments (id, amount, payment_date, journal_id, partner_id, invoice_id, memo, sync_status, is_local) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'new', 1)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
             localId,
             payment.amount,
@@ -589,7 +592,9 @@ export const saveLocalPayment = async (payment: any) => {
             payment.journal_id,
             payment.partner_id,
             payment.invoice_id,
-            payment.memo || ''
+            payment.memo || '',
+            syncStatus,
+            isLocal
         ]
     );
 
