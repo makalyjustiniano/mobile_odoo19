@@ -2,6 +2,27 @@ import { callOdoo } from '../api/odooClient';
 import * as db from './dbService';
 import * as FileSystem from 'expo-file-system/legacy';
 
+export const submitPickingDelivery = async (
+    pickingId: number,
+    deliveries: Array<{ moveId: number; quantity: number }>
+) => {
+    for (const delivery of deliveries) {
+        await callOdoo('stock.move', 'write', {
+            ids: [delivery.moveId],
+            vals: {
+                quantity: delivery.quantity
+            }
+        });
+    }
+
+    await callOdoo('stock.picking', 'button_validate', {
+        ids: [pickingId],
+        context: {
+            skip_backorder: true
+        }
+    });
+};
+
 export const runSync = async (onProgress?: (msg: string) => void) => {
     try {
         onProgress?.('Iniciando sincronización...');
@@ -46,34 +67,75 @@ export const runSync = async (onProgress?: (msg: string) => void) => {
         await db.saveSaleOrders(orders);
 
         // 3. Sync Account Moves (Cobranzas)
-        onProgress?.('Sincronizando cobranzas...');
-        const moves = await callOdoo('account.move', 'search_read', {
+        onProgress?.('Sincronizando facturas...');
+        const pendingMoves = await callOdoo('account.move', 'search_read', {
             domain: [
                 ['move_type', '=', 'out_invoice'],
                 ['state', '=', 'posted'],
                 ['payment_state', 'in', ['not_paid', 'partial']]
             ],
             fields: [
-                'name', 'partner_id', 'invoice_date', 'invoice_date_due', 
-                'amount_total', 'amount_residual', 'invoice_line_ids'
+                'name', 'partner_id', 'move_type', 'state', 'payment_state',
+                'invoice_date', 'invoice_date_due', 'amount_total',
+                'amount_residual', 'invoice_line_ids'
             ],
             limit: 50
         });
 
-        for (const move of moves) {
-            if (move.invoice_line_ids?.length > 0) {
-                move.lines = await callOdoo('account.move.line', 'search_read', {
-                    domain: [
-                        ['move_id', '=', move.id],
-                        ['display_type', 'not in', ['line_section', 'line_note']]
-                    ],
-                    fields: [
-                        'product_id', 'quantity', 'price_unit', 'price_subtotal', 
-                        'debit', 'credit', 'name', 'product_uom_id'
-                    ]
-                });
+        const saleInvoiceIds = Array.from(new Set(
+            orders.flatMap((o: any) => Array.isArray(o.invoice_ids) ? o.invoice_ids : [])
+        ));
+
+        let saleMoves: any[] = [];
+        if (saleInvoiceIds.length > 0) {
+            saleMoves = await callOdoo('account.move', 'search_read', {
+                domain: [['id', 'in', saleInvoiceIds]],
+                fields: [
+                    'name', 'partner_id', 'move_type', 'state', 'payment_state',
+                    'invoice_date', 'invoice_date_due', 'amount_total',
+                    'amount_residual', 'invoice_line_ids'
+                ],
+                limit: saleInvoiceIds.length
+            });
+        }
+
+        const moveMap = new Map<number, any>();
+        [...pendingMoves, ...saleMoves].forEach((move: any) => {
+            if (move?.id) {
+                moveMap.set(move.id, move);
+            }
+        });
+
+        const moves = Array.from(moveMap.values());
+        const moveIds = moves.map((move: any) => move.id).filter(Boolean);
+
+        if (moveIds.length > 0) {
+            const moveLines = await callOdoo('account.move.line', 'search_read', {
+                domain: [
+                    ['move_id', 'in', moveIds],
+                    ['display_type', 'not in', ['line_section', 'line_note']]
+                ],
+                fields: [
+                    'move_id', 'product_id', 'quantity', 'price_unit', 'price_subtotal',
+                    'debit', 'credit', 'name', 'product_uom_id'
+                ],
+                limit: moveIds.length * 20
+            });
+
+            const linesByMoveId = new Map<number, any[]>();
+            for (const line of moveLines) {
+                const moveId = Array.isArray(line.move_id) ? line.move_id[0] : line.move_id;
+                if (!linesByMoveId.has(moveId)) {
+                    linesByMoveId.set(moveId, []);
+                }
+                linesByMoveId.get(moveId)?.push(line);
+            }
+
+            for (const move of moves) {
+                move.lines = linesByMoveId.get(move.id) || [];
             }
         }
+
         await db.clearTable('account_moves');
         await db.clearTable('account_move_lines');
         await db.saveAccountMoves(moves);
@@ -81,12 +143,17 @@ export const runSync = async (onProgress?: (msg: string) => void) => {
         // 4. Sync Stock Moves (Distribucion)
         onProgress?.('Sincronizando distribución...');
         const stockMoves = await callOdoo('stock.move', 'search_read', {
-            domain: [['state', '=', 'assigned']],
-            fields: [
-                'reference', 'product_id', 'product_uom_qty', 'product_uom',
-                'state', 'origin', 'partner_id', 'date', 'date_deadline', 'move_line_ids'
+            domain: [
+                ['picking_code', '=', 'outgoing'],
+                ['partner_id', '!=', false],
+                ['state', 'in', ['draft', 'waiting', 'confirmed', 'partially_available', 'assigned']]
             ],
-            limit: 50
+            fields: [
+                'picking_id', 'reference', 'product_id', 'product_uom_qty', 'product_uom',
+                'state', 'origin', 'partner_id', 'date', 'date_deadline', 'move_line_ids',
+                'picking_code'
+            ],
+            limit: 500
         });
 
         for (const sm of stockMoves) {
@@ -370,6 +437,36 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
         }
 
         // 4. Upload new Payments
+        const localStockMoves = (await db.getUnsyncedRecords('stock_moves')) as any[];
+        const stockMoveGroups = new Map<number, any[]>();
+        for (const move of localStockMoves) {
+            if (move.sync_status === 'modified' && move.pending_delivery_qty && move.picking_id) {
+                if (!stockMoveGroups.has(move.picking_id)) {
+                    stockMoveGroups.set(move.picking_id, []);
+                }
+                stockMoveGroups.get(move.picking_id)?.push(move);
+            }
+        }
+
+        for (const [pickingId, groupMoves] of stockMoveGroups.entries()) {
+            onProgress?.(`Entregando transferencia: ${groupMoves[0]?.reference || pickingId}`);
+            try {
+                await submitPickingDelivery(
+                    pickingId,
+                    groupMoves.map((move) => ({
+                        moveId: move.id,
+                        quantity: move.pending_delivery_qty
+                    }))
+                );
+                for (const move of groupMoves) {
+                    await db.clearPendingStockMoveDelivery(move.id);
+                }
+            } catch (stockErr: any) {
+                console.error(`Error al entregar transferencia ${pickingId}: ${stockErr.message}`);
+            }
+        }
+
+        // 5. Upload new Payments
         const localPayments = await db.getUnsyncedRecords('account_payments');
         for (const p of localPayments as any[]) {
             if (p.sync_status === 'new') {

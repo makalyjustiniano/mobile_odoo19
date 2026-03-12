@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
     StyleSheet,
     View,
@@ -9,30 +9,23 @@ import {
     RefreshControl,
     LayoutAnimation,
     Platform,
-    UIManager
+    UIManager,
+    TextInput,
+    Alert
 } from 'react-native';
 import { FontAwesome } from '@expo/vector-icons';
 import { callOdoo } from '../../src/api/odooClient';
 import { useConfigStore } from '../../src/store/configStore';
 import * as db from '../../src/services/dbService';
+import { runSync, submitPickingDelivery } from '../../src/services/syncService';
 
-// Enable LayoutAnimation for Android
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
     UIManager.setLayoutAnimationEnabledExperimental(true);
 }
 
-interface StockMoveLine {
-    id: number;
-    product_id: [number, string];
-    quantity: number;
-    product_uom_id: [number, string];
-    lot_id: [number, string] | false;
-    location_id: [number, string];
-    location_dest_id: [number, string];
-}
-
 interface StockMove {
     id: number;
+    picking_id?: [number, string] | number | false;
     reference: string;
     product_id: [number, string];
     product_uom_qty: number;
@@ -42,20 +35,40 @@ interface StockMove {
     partner_id: [number, string] | false;
     date: string;
     date_deadline?: string;
-    move_line_ids: number[];
-    // UI state
-    expanded?: boolean;
-    lines?: StockMoveLine[];
-    loadingLines?: boolean;
+    pending_delivery_qty?: number | null;
 }
 
 type ViewMode = 'client' | 'product';
+
+interface DeliveryGroup {
+    key: string;
+    pickingId: number | null;
+    reference: string;
+    partnerName: string;
+    origin: string;
+    scheduledDate: string;
+    moves: StockMove[];
+}
+
+const getMoveQuantityInput = (move: StockMove, qtyMap: Record<number, string>) =>
+    qtyMap[move.id] ?? String(move.pending_delivery_qty ?? move.product_uom_qty ?? '');
+
+const getRemainingQty = (move: StockMove, qtyMap: Record<number, string>) => {
+    const enteredQty = parseFloat(getMoveQuantityInput(move, qtyMap));
+    if (Number.isNaN(enteredQty)) {
+        return Number(move.product_uom_qty || 0);
+    }
+    return Math.max(0, Number(move.product_uom_qty || 0) - enteredQty);
+};
 
 export default function DistribucionScreen() {
     const [moves, setMoves] = useState<StockMove[]>([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
     const [viewMode, setViewMode] = useState<ViewMode>('client');
+    const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+    const [deliveryQtyByMove, setDeliveryQtyByMove] = useState<Record<number, string>>({});
+    const [submittingGroupKey, setSubmittingGroupKey] = useState<string | null>(null);
     const isOffline = useConfigStore((state) => state.isOffline);
 
     const fetchMoves = async () => {
@@ -64,16 +77,19 @@ export default function DistribucionScreen() {
             setLoading(true);
 
             if (isOffline) {
-                console.log('Fetching stock moves from SQLite...');
                 const localData = await db.getStockMoves();
                 setMoves(localData as any);
                 return;
             }
 
-            console.log('Fetching stock moves from Odoo...');
             const result = await callOdoo('stock.move', 'search_read', {
-                domain: [['state', '=', 'assigned']],
+                domain: [
+                    ['picking_code', '=', 'outgoing'],
+                    ['partner_id', '!=', false],
+                    ['state', 'in', ['draft', 'waiting', 'confirmed', 'partially_available', 'assigned']]
+                ],
                 fields: [
+                    'picking_id',
                     'reference',
                     'product_id',
                     'product_uom_qty',
@@ -82,12 +98,11 @@ export default function DistribucionScreen() {
                     'origin',
                     'partner_id',
                     'date',
-                    'date_deadline',
-                    'move_line_ids'
+                    'date_deadline'
                 ],
-                limit: 100
+                limit: 500
             });
-            setMoves(result.map((m: any) => ({ ...m, expanded: false, lines: [], loadingLines: false })));
+            setMoves(result as StockMove[]);
         } catch (error) {
             console.error('Error fetching delivery moves:', error);
         } finally {
@@ -96,174 +111,220 @@ export default function DistribucionScreen() {
         }
     };
 
-    const fetchLinesForMove = async (moveId: number) => {
-        if (isOffline) return; // Lines are already loaded in getStockMoves
-        try {
-            setMoves(prev => prev.map(m => m.id === moveId ? { ...m, loadingLines: true } : m));
-
-            const lines = await callOdoo('stock.move.line', 'search_read', {
-                domain: [['move_id', '=', moveId]],
-                fields: [
-                    'product_id',
-                    'quantity',
-                    'product_uom_id',
-                    'lot_id',
-                    'location_id',
-                    'location_dest_id'
-                ]
-            });
-
-            setMoves(prev => prev.map(m =>
-                m.id === moveId ? { ...m, lines, loadingLines: false } : m
-            ));
-        } catch (error) {
-            console.error(`Error fetching lines for move ${moveId}:`, error);
-            setMoves(prev => prev.map(m => m.id === moveId ? { ...m, loadingLines: false } : m));
-        }
-    };
-
-    const toggleExpand = (moveId: number) => {
-        LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-
-        let targetMove: StockMove | undefined;
-        setMoves(prev => {
-            const newState = prev.map(m => {
-                if (m.id === moveId) {
-                    const isExpanding = !m.expanded;
-                    targetMove = { ...m, expanded: isExpanding };
-                    return targetMove;
-                }
-                return m;
-            });
-            return newState;
-        });
-
-        if (targetMove && targetMove.expanded && targetMove.lines && targetMove.lines.length === 0) {
-            fetchLinesForMove(targetMove.id);
-        }
-    };
-
     useEffect(() => {
         fetchMoves();
     }, [isOffline]);
+
+    const groups = useMemo(() => {
+        const map = new Map<string, DeliveryGroup>();
+
+        for (const move of moves) {
+            const pickingId = Array.isArray(move.picking_id) ? move.picking_id[0] : (move.picking_id || null);
+            const key = String(pickingId ?? move.reference ?? move.id);
+            if (!map.has(key)) {
+                map.set(key, {
+                    key,
+                    pickingId,
+                    reference: move.reference || `MOVE/${move.id}`,
+                    partnerName: Array.isArray(move.partner_id) ? move.partner_id[1] : 'Cliente No Definido',
+                    origin: move.origin || 'N/A',
+                    scheduledDate: move.date_deadline || move.date,
+                    moves: []
+                });
+            }
+            map.get(key)?.moves.push(move);
+        }
+
+        const result = Array.from(map.values());
+        if (viewMode === 'product') {
+            result.forEach(group => {
+                group.moves.sort((a, b) => a.product_id[1].localeCompare(b.product_id[1]));
+            });
+        }
+        return result.sort((a, b) => a.reference.localeCompare(b.reference));
+    }, [moves, viewMode]);
 
     const onRefresh = () => {
         setRefreshing(true);
         fetchMoves();
     };
 
-    const getGroupedData = () => {
-        if (viewMode === 'client') {
-            return moves;
-        } else {
-            // Sort by product name for 'Por Producto' view
-            return [...moves].sort((a, b) => a.product_id[1].localeCompare(b.product_id[1]));
+    const toggleExpand = (groupKey: string) => {
+        LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+        setExpandedGroups(prev => ({ ...prev, [groupKey]: !prev[groupKey] }));
+    };
+
+    const handleDeliveryQtyChange = (moveId: number, value: string) => {
+        setDeliveryQtyByMove(prev => ({ ...prev, [moveId]: value }));
+    };
+
+    const handleFillAllQuantities = (group: DeliveryGroup) => {
+        const nextValues: Record<number, string> = {};
+        for (const move of group.moves) {
+            nextValues[move.id] = String(move.product_uom_qty || 0);
+        }
+        setDeliveryQtyByMove(prev => ({ ...prev, ...nextValues }));
+    };
+
+    const handleDeliverGroup = async (group: DeliveryGroup) => {
+        if (!group.pickingId) {
+            Alert.alert('Error', 'La transferencia no tiene `picking_id` asociado.');
+            return;
+        }
+
+        const deliveries = [];
+        for (const move of group.moves) {
+            const qty = parseFloat(getMoveQuantityInput(move, deliveryQtyByMove));
+            if (Number.isNaN(qty) || qty <= 0) {
+                Alert.alert('Error', `La cantidad de ${move.product_id[1]} debe ser mayor a cero.`);
+                return;
+            }
+            if (qty > Number(move.product_uom_qty || 0)) {
+                Alert.alert('Error', `No puedes entregar mas de lo solicitado en ${move.product_id[1]}.`);
+                return;
+            }
+            deliveries.push({ moveId: move.id, quantity: qty });
+        }
+
+        try {
+            setSubmittingGroupKey(group.key);
+
+            if (isOffline) {
+                for (const delivery of deliveries) {
+                    await db.queueStockMoveDelivery(delivery.moveId, group.pickingId, delivery.quantity);
+                }
+                Alert.alert('Éxito', 'Entrega guardada localmente. Se enviara a Odoo al sincronizar.');
+                fetchMoves();
+                return;
+            }
+
+            await submitPickingDelivery(group.pickingId, deliveries);
+            await runSync();
+            Alert.alert('Éxito', 'Entrega registrada en Odoo.');
+            fetchMoves();
+        } catch (error: any) {
+            console.error('Error delivering picking:', error);
+            Alert.alert('Error', `No se pudo registrar la entrega: ${error.message}`);
+        } finally {
+            setSubmittingGroupKey(null);
         }
     };
 
-    const renderLine = (line: StockMoveLine) => (
-        <View key={line.id} style={styles.lineItem}>
-            <View style={styles.lineRow}>
-                <FontAwesome name="cube" size={12} color="#00A09D" />
-                <Text style={styles.lineProductName}>{line.product_id[1]}</Text>
+    const renderProductRow = (move: StockMove) => (
+        <View key={move.id} style={styles.productCard}>
+            <View style={styles.productInfo}>
+                <Text style={styles.productName}>{move.product_id[1]}</Text>
+                <Text style={styles.productMeta}>
+                    Solicitado: {move.product_uom_qty} {move.product_uom[1]}
+                </Text>
+                <Text style={styles.remainingText}>
+                    Faltante: {getRemainingQty(move, deliveryQtyByMove)} {move.product_uom[1]}
+                </Text>
+                {move.pending_delivery_qty ? (
+                    <Text style={styles.pendingText}>
+                        Pendiente de sincronizar: {move.pending_delivery_qty} {move.product_uom[1]}
+                    </Text>
+                ) : null}
             </View>
-            <View style={styles.lineDetailRow}>
-                <Text style={styles.lineQty}>{line.quantity} {line.product_uom_id[1]}</Text>
-                {line.lot_id && (
-                    <View style={styles.lineLotBadge}>
-                        <Text style={styles.lineLotText}>Lot: {line.lot_id[1]}</Text>
+            <TextInput
+                value={getMoveQuantityInput(move, deliveryQtyByMove)}
+                onChangeText={(value) => handleDeliveryQtyChange(move.id, value)}
+                keyboardType="decimal-pad"
+                style={styles.deliveryInput}
+                placeholder="Cant."
+            />
+        </View>
+    );
+
+    const renderGroup = ({ item }: { item: DeliveryGroup }) => {
+        const expanded = !!expandedGroups[item.key];
+        const totalRequested = item.moves.reduce((acc, move) => acc + Number(move.product_uom_qty || 0), 0);
+
+        return (
+            <View style={[styles.card, expanded && styles.cardExpanded]}>
+                <TouchableOpacity
+                    activeOpacity={0.7}
+                    onPress={() => toggleExpand(item.key)}
+                    style={styles.cardHeader}
+                >
+                    <View style={styles.headerInfo}>
+                        <View style={styles.topRow}>
+                            <View style={styles.refRow}>
+                                <FontAwesome name="truck" size={14} color="#714B67" />
+                                <Text style={styles.reference}>{item.reference}</Text>
+                            </View>
+                            <View style={styles.dateBadge}>
+                                <FontAwesome name="calendar" size={10} color="#714B67" />
+                                <Text style={styles.dateBadgeText}>
+                                    {new Date(item.scheduledDate).toLocaleDateString()}
+                                </Text>
+                            </View>
+                        </View>
+
+                        {viewMode === 'client' ? (
+                            <View style={styles.mainInfoRow}>
+                                <FontAwesome name="user" size={14} color="#00A09D" />
+                                <Text style={styles.mainTitle}>{item.partnerName}</Text>
+                            </View>
+                        ) : (
+                            <View style={styles.mainInfoRow}>
+                                <FontAwesome name="cubes" size={14} color="#00A09D" />
+                                <Text style={styles.mainTitle}>{item.moves.length} productos</Text>
+                            </View>
+                        )}
+
+                        <Text style={styles.originText}>Origen: {item.origin}</Text>
+                    </View>
+
+                    <View style={styles.headerRight}>
+                        <Text style={styles.mainQty}>{item.moves.length} items</Text>
+                        <Text style={styles.totalQty}>Total: {totalRequested}</Text>
+                        <FontAwesome
+                            name={expanded ? 'chevron-up' : 'chevron-down'}
+                            size={14}
+                            color="#714B67"
+                            style={{ marginTop: 8 }}
+                        />
+                    </View>
+                </TouchableOpacity>
+
+                {expanded && (
+                    <View style={styles.expandedContent}>
+                        <View style={styles.divider} />
+                        <View style={styles.sectionHeader}>
+                            <Text style={styles.linesTitle}>Productos</Text>
+                            <TouchableOpacity
+                                style={styles.fillAllButton}
+                                onPress={() => handleFillAllQuantities(item)}
+                            >
+                                <Text style={styles.fillAllButtonText}>ENTREGAR TODO</Text>
+                            </TouchableOpacity>
+                        </View>
+                        {item.moves.map(renderProductRow)}
+                        <TouchableOpacity
+                            style={[
+                                styles.deliverButton,
+                                submittingGroupKey === item.key && styles.deliverButtonDisabled
+                            ]}
+                            onPress={() => handleDeliverGroup(item)}
+                            disabled={submittingGroupKey === item.key}
+                        >
+                            <FontAwesome name="check" size={14} color="#fff" />
+                            <Text style={styles.deliverButtonText}>
+                                {submittingGroupKey === item.key ? 'GUARDANDO...' : 'ENTREGAR TRANSFERENCIA'}
+                            </Text>
+                        </TouchableOpacity>
                     </View>
                 )}
             </View>
-            <View style={styles.lineLocationRow}>
-                <Text style={styles.locationText}>De: {line.location_id[1].split('/').pop()}</Text>
-                <FontAwesome name="long-arrow-right" size={10} color="#999" style={{ marginHorizontal: 5 }} />
-                <Text style={styles.locationText}>A: {line.location_dest_id[1].split('/').pop()}</Text>
-            </View>
-        </View>
-    );
-
-    const renderItem = ({ item }: { item: StockMove }) => (
-        <View style={[styles.card, item.expanded && styles.cardExpanded]}>
-            <TouchableOpacity
-                activeOpacity={0.7}
-                onPress={() => toggleExpand(item.id)}
-                style={styles.cardHeader}
-            >
-                <View style={styles.headerInfo}>
-                    <View style={styles.topRow}>
-                        <View style={styles.refRow}>
-                            <FontAwesome name="truck" size={14} color="#714B67" />
-                            <Text style={styles.reference}>{item.reference}</Text>
-                        </View>
-                        <View style={styles.dateBadge}>
-                            <FontAwesome name="calendar" size={10} color="#714B67" />
-                            <Text style={styles.dateBadgeText}>
-                                {new Date(item.date_deadline || item.date).toLocaleDateString()}
-                            </Text>
-                        </View>
-                    </View>
-
-                    {viewMode === 'client' ? (
-                        <>
-                            <View style={styles.mainInfoRow}>
-                                <FontAwesome name="user" size={14} color="#00A09D" />
-                                <Text style={styles.mainTitle}>{item.partner_id ? item.partner_id[1] : 'Cliente No Definido'}</Text>
-                            </View>
-                            <View style={styles.productRow}>
-                                <FontAwesome name="tag" size={12} color="#6B7280" />
-                                <Text style={styles.subTitle}>{item.product_id[1]}</Text>
-                            </View>
-                        </>
-                    ) : (
-                        <>
-                            <View style={styles.mainInfoRow}>
-                                <FontAwesome name="cube" size={14} color="#00A09D" />
-                                <Text style={styles.mainTitle}>{item.product_id[1]}</Text>
-                            </View>
-                            <View style={styles.productRow}>
-                                <FontAwesome name="user" size={12} color="#6B7280" />
-                                <Text style={styles.subTitle}>{item.partner_id ? item.partner_id[1] : 'Cliente No Definido'}</Text>
-                            </View>
-                        </>
-                    )}
-
-                    <Text style={styles.originText}>Origen: {item.origin || 'N/A'}</Text>
-                </View>
-
-                <View style={styles.headerRight}>
-                    <Text style={styles.mainQty}>{item.product_uom_qty} {item.product_uom[1]}</Text>
-                    <FontAwesome
-                        name={item.expanded ? "chevron-up" : "chevron-down"}
-                        size={14}
-                        color="#714B67"
-                        style={{ marginTop: 8 }}
-                    />
-                </View>
-            </TouchableOpacity>
-
-            {item.expanded && (
-                <View style={styles.expandedContent}>
-                    <View style={styles.divider} />
-                    <Text style={styles.linesTitle}>Detalles de Movimiento (stock.move.line)</Text>
-
-                    {item.loadingLines ? (
-                        <ActivityIndicator size="small" color="#00A09D" style={{ marginVertical: 10 }} />
-                    ) : item.lines && item.lines.length > 0 ? (
-                        item.lines.map(renderLine)
-                    ) : (
-                        <Text style={styles.noLinesText}>No hay líneas...</Text>
-                    )}
-                </View>
-            )}
-        </View>
-    );
+        );
+    };
 
     if (loading && !refreshing) {
         return (
             <View style={styles.centerContainer}>
                 <ActivityIndicator size="large" color="#714B67" />
-                <Text style={styles.loadingText}>Cargando datos de distribución...</Text>
+                <Text style={styles.loadingText}>Cargando datos de distribucion...</Text>
             </View>
         );
     }
@@ -271,7 +332,7 @@ export default function DistribucionScreen() {
     return (
         <View style={styles.container}>
             <View style={styles.topHeader}>
-                <Text style={styles.headerTitle}>Distribución</Text>
+                <Text style={styles.headerTitle}>Distribucion</Text>
                 <View style={styles.selectorContainer}>
                     <TouchableOpacity
                         style={[styles.selectorBtn, viewMode === 'client' && styles.selectorBtnActive]}
@@ -295,9 +356,9 @@ export default function DistribucionScreen() {
             </View>
 
             <FlatList
-                data={getGroupedData()}
-                keyExtractor={(item) => item.id.toString()}
-                renderItem={renderItem}
+                data={groups}
+                keyExtractor={(item) => item.key}
+                renderItem={renderGroup}
                 contentContainerStyle={styles.listContent}
                 refreshControl={
                     <RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={['#714B67']} />
@@ -305,7 +366,7 @@ export default function DistribucionScreen() {
                 ListEmptyComponent={
                     <View style={styles.emptyContainer}>
                         <FontAwesome name="dropbox" size={80} color="#ccc" />
-                        <Text style={styles.emptyText}>No hay movimientos asignados</Text>
+                        <Text style={styles.emptyText}>No hay entregas pendientes</Text>
                     </View>
                 }
             />
@@ -430,17 +491,6 @@ const styles = StyleSheet.create({
         marginLeft: 8,
         flex: 1,
     },
-    subTitle: {
-        fontSize: 14,
-        color: '#4B5563',
-        marginVertical: 2,
-        marginLeft: 8,
-    },
-    productRow: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        marginLeft: 22,
-    },
     originText: {
         fontSize: 12,
         color: '#9CA3AF',
@@ -455,6 +505,11 @@ const styles = StyleSheet.create({
         fontSize: 15,
         fontWeight: 'bold',
         color: '#714B67',
+    },
+    totalQty: {
+        fontSize: 12,
+        color: '#6B7280',
+        marginTop: 2,
     },
     expandedContent: {
         backgroundColor: '#F9FAFB',
@@ -471,64 +526,91 @@ const styles = StyleSheet.create({
         fontWeight: 'bold',
         color: '#6B7280',
         textTransform: 'uppercase',
-        marginBottom: 10,
         letterSpacing: 0.5,
     },
-    lineItem: {
-        backgroundColor: '#fff',
+    sectionHeader: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        marginBottom: 10,
+    },
+    fillAllButton: {
+        backgroundColor: '#ECFDF5',
+        borderWidth: 1,
+        borderColor: '#A7F3D0',
+        paddingHorizontal: 10,
+        paddingVertical: 6,
         borderRadius: 8,
-        padding: 10,
+    },
+    fillAllButtonText: {
+        color: '#065F46',
+        fontSize: 11,
+        fontWeight: '700',
+    },
+    productCard: {
+        backgroundColor: '#fff',
+        borderRadius: 10,
+        padding: 12,
         marginBottom: 8,
         borderWidth: 1,
-        borderColor: '#F3F4FB',
-    },
-    lineRow: {
+        borderColor: '#E5E7EB',
         flexDirection: 'row',
         alignItems: 'center',
-        marginBottom: 4,
     },
-    lineProductName: {
-        fontSize: 14,
-        color: '#374151',
-        marginLeft: 6,
+    productInfo: {
         flex: 1,
+        marginRight: 10,
     },
-    lineDetailRow: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        marginVertical: 4,
+    productName: {
+        fontSize: 14,
+        fontWeight: '600',
+        color: '#111827',
     },
-    lineQty: {
-        fontSize: 13,
-        fontWeight: 'bold',
-        color: '#00A09D',
+    productMeta: {
+        fontSize: 12,
+        color: '#6B7280',
+        marginTop: 3,
     },
-    lineLotBadge: {
-        backgroundColor: '#E6F6F5',
-        paddingHorizontal: 6,
-        paddingVertical: 2,
-        borderRadius: 4,
+    remainingText: {
+        fontSize: 12,
+        color: '#1D4ED8',
+        marginTop: 3,
+        fontWeight: '600',
     },
-    lineLotText: {
-        fontSize: 10,
-        color: '#00A09D',
-        fontWeight: 'bold',
-    },
-    lineLocationRow: {
-        flexDirection: 'row',
-        alignItems: 'center',
+    pendingText: {
+        fontSize: 12,
+        color: '#B45309',
         marginTop: 4,
+        fontWeight: '600',
     },
-    locationText: {
-        fontSize: 11,
-        color: '#9CA3AF',
-    },
-    noLinesText: {
+    deliveryInput: {
+        width: 96,
+        borderWidth: 1,
+        borderColor: '#D1D5DB',
+        borderRadius: 10,
+        paddingHorizontal: 10,
+        paddingVertical: 10,
+        fontSize: 15,
         textAlign: 'center',
-        color: '#9CA3AF',
+        backgroundColor: '#fff',
+    },
+    deliverButton: {
+        marginTop: 12,
+        backgroundColor: '#059669',
+        borderRadius: 10,
+        paddingVertical: 12,
+        flexDirection: 'row',
+        justifyContent: 'center',
+        alignItems: 'center',
+        gap: 8,
+    },
+    deliverButtonDisabled: {
+        opacity: 0.7,
+    },
+    deliverButtonText: {
+        color: '#fff',
         fontSize: 13,
-        padding: 10,
+        fontWeight: '700',
     },
     centerContainer: {
         flex: 1,

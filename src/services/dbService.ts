@@ -81,6 +81,9 @@ export const initDB = async () => {
             id INTEGER PRIMARY KEY,
             name TEXT,
             partner_name TEXT,
+            move_type TEXT,
+            state TEXT,
+            payment_state TEXT,
             invoice_date TEXT,
             invoice_date_due TEXT,
             amount_total REAL,
@@ -106,6 +109,7 @@ export const initDB = async () => {
         )`,
         `CREATE TABLE IF NOT EXISTS stock_moves (
             id INTEGER PRIMARY KEY,
+            picking_id INTEGER,
             reference TEXT,
             product_name TEXT,
             product_uom_qty REAL,
@@ -115,6 +119,8 @@ export const initDB = async () => {
             partner_name TEXT,
             date TEXT,
             date_deadline TEXT,
+            pending_delivery_qty REAL,
+            pending_delivery_date TEXT,
             sync_status TEXT DEFAULT 'synced',
             is_local INTEGER DEFAULT 0
         )`,
@@ -191,9 +197,17 @@ export const initDB = async () => {
         }
         if (table === 'account_moves') {
             await addColumnIfMissing(table, 'origin_order_id', "INTEGER");
+            await addColumnIfMissing(table, 'move_type', "TEXT");
+            await addColumnIfMissing(table, 'state', "TEXT");
+            await addColumnIfMissing(table, 'payment_state', "TEXT");
         }
         if (table === 'account_move_lines') {
             await addColumnIfMissing(table, 'sale_line_id', "INTEGER");
+        }
+        if (table === 'stock_moves') {
+            await addColumnIfMissing(table, 'picking_id', "INTEGER");
+            await addColumnIfMissing(table, 'pending_delivery_qty', "REAL");
+            await addColumnIfMissing(table, 'pending_delivery_date', "TEXT");
         }
         if (table === 'partners') {
             await addColumnIfMissing(table, 'vat', "TEXT");
@@ -287,12 +301,15 @@ export const createInvoiceLocal = async (orderId: number) => {
     const localInvoiceId = -Math.floor(Date.now() / 1000);
     
     await db.runAsync(
-        `INSERT INTO account_moves (id, name, partner_name, invoice_date, amount_total, amount_residual, origin_order_id, sync_status, is_local) 
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'new', 1)`,
+        `INSERT INTO account_moves (id, name, partner_name, move_type, state, payment_state, invoice_date, amount_total, amount_residual, origin_order_id, sync_status, is_local) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', 1)`,
         [
             localInvoiceId, 
             `INV/Local/${localInvoiceId}`, 
             order.partner_name, 
+            'out_invoice',
+            'posted',
+            'not_paid',
             new Date().toISOString().split('T')[0], 
             order.amount_total, 
             order.amount_total,
@@ -434,11 +451,14 @@ export const saveAccountMoves = async (moves: any[]) => {
     const db = await getDb();
     for (const m of moves) {
         await db.runAsync(
-            `INSERT OR REPLACE INTO account_moves (id, name, partner_name, invoice_date, invoice_date_due, amount_total, amount_residual) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT OR REPLACE INTO account_moves (id, name, partner_name, move_type, state, payment_state, invoice_date, invoice_date_due, amount_total, amount_residual) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 m.id || 0,
                 m.name || '',
                 Array.isArray(m.partner_id) ? m.partner_id[1] : '',
+                m.move_type || '',
+                m.state || '',
+                m.payment_state || '',
                 m.invoice_date || '',
                 m.invoice_date_due || '',
                 m.amount_total || 0,
@@ -467,9 +487,17 @@ export const saveAccountMoves = async (moves: any[]) => {
     }
 };
 
-export const getAccountMoves = async () => {
+export const getAccountMoves = async (options?: { pendingOnly?: boolean }) => {
     const db = await getDb();
-    const moves: any[] = await db.getAllAsync('SELECT * FROM account_moves');
+    const pendingOnly = options?.pendingOnly ?? false;
+    const moves: any[] = pendingOnly
+        ? await db.getAllAsync(
+            `SELECT * FROM account_moves
+             WHERE move_type = 'out_invoice'
+             AND state = 'posted'
+             AND payment_state IN ('not_paid', 'partial')`
+        )
+        : await db.getAllAsync('SELECT * FROM account_moves');
     for (const m of moves) {
         m.lines = await db.getAllAsync('SELECT * FROM account_move_lines WHERE move_id = ?', [m.id]);
         m.partner_id = [0, m.partner_name];
@@ -486,9 +514,10 @@ export const saveStockMoves = async (moves: any[]) => {
     const db = await getDb();
     for (const m of moves) {
         await db.runAsync(
-            `INSERT OR REPLACE INTO stock_moves (id, reference, product_name, product_uom_qty, uom_name, state, origin, partner_name, date, date_deadline) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT OR REPLACE INTO stock_moves (id, picking_id, reference, product_name, product_uom_qty, uom_name, state, origin, partner_name, date, date_deadline, pending_delivery_qty, pending_delivery_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 m.id || 0,
+                Array.isArray(m.picking_id) ? m.picking_id[0] : (m.picking_id || null),
                 m.reference || '',
                 Array.isArray(m.product_id) ? m.product_id[1] : '',
                 m.product_uom_qty || 0,
@@ -497,7 +526,9 @@ export const saveStockMoves = async (moves: any[]) => {
                 m.origin || '',
                 Array.isArray(m.partner_id) ? m.partner_id[1] : '',
                 m.date || '',
-                m.date_deadline || ''
+                m.date_deadline || '',
+                null,
+                null
             ]
         );
         
@@ -538,6 +569,26 @@ export const getStockMoves = async () => {
         }
     }
     return moves;
+};
+
+export const queueStockMoveDelivery = async (moveId: number, pickingId: number, deliveredQty: number) => {
+    const db = await getDb();
+    await db.runAsync(
+        `UPDATE stock_moves
+         SET picking_id = ?, pending_delivery_qty = ?, pending_delivery_date = ?, sync_status = 'modified', is_local = 1
+         WHERE id = ?`,
+        [pickingId, deliveredQty, new Date().toISOString(), moveId]
+    );
+};
+
+export const clearPendingStockMoveDelivery = async (moveId: number) => {
+    const db = await getDb();
+    await db.runAsync(
+        `UPDATE stock_moves
+         SET pending_delivery_qty = NULL, pending_delivery_date = NULL, sync_status = 'synced', is_local = 0
+         WHERE id = ?`,
+        [moveId]
+    );
 };
 
 // Products

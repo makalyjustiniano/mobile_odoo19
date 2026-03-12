@@ -73,7 +73,7 @@ export default function CobranzasScreen() {
 
             if (isOffline) {
                 console.log('Fetching invoices from SQLite...');
-                const localData = await db.getAccountMoves();
+                const localData = await db.getAccountMoves({ pendingOnly: true });
                 setInvoices(localData as any);
                 return;
             }
