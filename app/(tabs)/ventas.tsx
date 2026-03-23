@@ -17,6 +17,8 @@ import {
 import { FontAwesome } from '@expo/vector-icons';
 import { callOdoo } from '../../src/api/odooClient';
 import { useConfigStore } from '../../src/store/configStore';
+import { usePartnerStore } from '../../src/store/usePartnerStore';
+import { useProductStore } from '../../src/store/useProductStore';
 import * as db from '../../src/services/dbService';
 
 interface SaleOrderLine {
@@ -152,56 +154,68 @@ export default function VentasScreen() {
     // Partner search logic
     const searchPartners = async (query: string) => {
         setPartnerSearch(query);
-        if (query.length < 2) {
+        if (query.length < 1) {
             setPartners([]);
             setShowPartnerResults(false);
             return;
         }
-        try {
-            if (isOffline) {
-                const results = await db.searchPartners(query);
-                setPartners(results as any);
-                setShowPartnerResults(true);
-                return;
-            }
 
-            const results = await callOdoo('res.partner', 'search_read', {
-                domain: [['name', 'ilike', query], ['customer_rank', '>', 0]],
-                fields: ['display_name'],
-                limit: 5
-            });
-            setPartners(results);
-            setShowPartnerResults(true);
-        } catch (error) {
-            console.error('Error searching partners:', error);
+        // 1. Busqueda local (Instantanea)
+        const localResults = usePartnerStore.getState().searchPartnersLocal(query);
+        setPartners(localResults as any);
+        setShowPartnerResults(true);
+
+        // 2. Busqueda online de respaldo (si no es offline)
+        if (!isOffline) {
+            try {
+                const results = await callOdoo('res.partner', 'search_read', {
+                    domain: [['name', 'ilike', query]],
+                    fields: ['name'],
+                    limit: 10
+                });
+                
+                const partnerArray = Array.isArray(results) ? results : (results?.result || []);
+                if (partnerArray.length > 0) {
+                    setPartners(partnerArray.map((p: any) => ({
+                        id: p.id,
+                        display_name: p.name || p.display_name
+                    })));
+                }
+            } catch (error) {
+                console.log('Online partner search failed, using local results.');
+            }
         }
     };
 
     // Product search logic
     const searchProducts = async (query: string) => {
         setProductSearch(query);
-        if (query.length < 2) {
+        if (query.length < 1) {
             setProducts([]);
             setShowProductResults(false);
             return;
         }
-        try {
-            if (isOffline) {
-                const results = await db.searchProducts(query);
-                setProducts(results as any);
-                setShowProductResults(true);
-                return;
-            }
 
-            const results = await callOdoo('product.product', 'search_read', {
-                domain: [['name', 'ilike', query], ['sale_ok', '=', true]],
-                fields: ['display_name', 'list_price'],
-                limit: 5
-            });
-            setProducts(results);
-            setShowProductResults(true);
-        } catch (error) {
-            console.error('Error searching products:', error);
+        // 1. Busqueda local
+        const localResults = useProductStore.getState().searchProductsLocal(query);
+        setProducts(localResults as any);
+        setShowProductResults(true);
+
+        if (!isOffline) {
+            try {
+                const results = await callOdoo('product.product', 'search_read', {
+                    domain: [['name', 'ilike', query], ['sale_ok', '=', true]],
+                    fields: ['display_name', 'list_price'],
+                    limit: 10
+                });
+                
+                const productArray = Array.isArray(results) ? results : (results?.result || []);
+                if (productArray.length > 0) {
+                    setProducts(productArray);
+                }
+            } catch (error) {
+                console.log('Online product search failed, using local.');
+            }
         }
     };
 
@@ -540,10 +554,45 @@ export default function VentasScreen() {
                         </View>
 
                         <ScrollView style={styles.modalBody} keyboardShouldPersistTaps="handled">
-                            <Text style={styles.inputLabel}>Cliente</Text>
+                            
+                            {/* Product Selection (AHORA ARRIBA POR PEDIDO DEL USUARIO) */}
+                            <Text style={[styles.inputLabel, { color: '#00A09D' }]}>1. Agregar Productos</Text>
+                            <View style={styles.searchWrapper}>
+                                <TextInput
+                                    style={styles.searchInput}
+                                    placeholder="Nombre del producto..."
+                                    value={productSearch}
+                                    onChangeText={searchProducts}
+                                />
+                                {showProductResults && (
+                                    <View style={[styles.searchResults, { zIndex: 100, elevation: 5 }]}>
+                                        {products.length > 0 ? (
+                                            products.map(p => (
+                                                <TouchableOpacity
+                                                    key={p.id}
+                                                    style={styles.resultItem}
+                                                    onPress={() => addProductToQuote(p)}
+                                                >
+                                                    <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                                                        <Text style={{ flex: 1, color: '#374151' }}>{p.display_name}</Text>
+                                                        <Text style={{ fontWeight: 'bold' }}>Bs. {p.list_price}</Text>
+                                                    </View>
+                                                </TouchableOpacity>
+                                            ))
+                                        ) : (
+                                            <View style={{ padding: 12 }}>
+                                                <Text style={{ color: '#9CA3AF', fontStyle: 'italic', fontSize: 13 }}>No se encontraron productos</Text>
+                                            </View>
+                                        )}
+                                    </View>
+                                )}
+                            </View>
+
+                            {/* Partner Selection (AHORA ABAJO POR PEDIDO DEL USUARIO) */}
+                            <Text style={[styles.inputLabel, { marginTop: 25, color: '#00A09D' }]}>2. Seleccionar Cliente</Text>
                             {selectedPartner ? (
                                 <View style={styles.selectedItem}>
-                                    <Text style={styles.selectedText}>{selectedPartner.display_name}</Text>
+                                    <Text style={styles.selectedText}>{selectedPartner.display_name || (selectedPartner as any).name}</Text>
                                     <TouchableOpacity onPress={() => setSelectedPartner(null)}>
                                         <FontAwesome name="times-circle" size={20} color="#EF4444" />
                                     </TouchableOpacity>
@@ -557,49 +606,30 @@ export default function VentasScreen() {
                                         onChangeText={searchPartners}
                                     />
                                     {showPartnerResults && (
-                                        <View style={styles.searchResults}>
-                                            {partners.map(p => (
-                                                <TouchableOpacity
-                                                    key={p.id}
-                                                    style={styles.resultItem}
-                                                    onPress={() => {
-                                                        setSelectedPartner(p);
-                                                        setShowPartnerResults(false);
-                                                    }}
-                                                >
-                                                    <Text>{p.display_name}</Text>
-                                                </TouchableOpacity>
-                                            ))}
+                                        <View style={[styles.searchResults, { zIndex: 100, elevation: 5 }]}>
+                                            {partners.length > 0 ? (
+                                                partners.map(p => (
+                                                    <TouchableOpacity
+                                                        key={p.id}
+                                                        style={styles.resultItem}
+                                                        onPress={() => {
+                                                            setSelectedPartner(p);
+                                                            setShowPartnerResults(false);
+                                                            setPartnerSearch(p.display_name || (p as any).name);
+                                                        }}
+                                                    >
+                                                        <Text style={{ color: '#374151' }}>{p.display_name || (p as any).name}</Text>
+                                                    </TouchableOpacity>
+                                                ))
+                                            ) : (
+                                                <View style={{ padding: 12 }}>
+                                                    <Text style={{ color: '#9CA3AF', fontStyle: 'italic', fontSize: 13 }}>No se encontraron clientes</Text>
+                                                </View>
+                                            )}
                                         </View>
                                     )}
                                 </View>
                             )}
-
-                            <Text style={[styles.inputLabel, { marginTop: 20 }]}>Agregar Productos</Text>
-                            <View style={styles.searchWrapper}>
-                                <TextInput
-                                    style={styles.searchInput}
-                                    placeholder="Nombre del producto..."
-                                    value={productSearch}
-                                    onChangeText={searchProducts}
-                                />
-                                {showProductResults && (
-                                    <View style={styles.searchResults}>
-                                        {products.map(p => (
-                                            <TouchableOpacity
-                                                key={p.id}
-                                                style={styles.resultItem}
-                                                onPress={() => addProductToQuote(p)}
-                                            >
-                                                <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
-                                                    <Text style={{ flex: 1 }}>{p.display_name}</Text>
-                                                    <Text style={{ fontWeight: 'bold' }}>Bs. {p.list_price}</Text>
-                                                </View>
-                                            </TouchableOpacity>
-                                        ))}
-                                    </View>
-                                )}
-                            </View>
 
                             <Text style={[styles.inputLabel, { marginTop: 20 }]}>Productos Seleccionados</Text>
                             {quoteLines.length === 0 ? (

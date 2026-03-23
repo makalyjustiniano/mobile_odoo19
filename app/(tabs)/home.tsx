@@ -1,7 +1,10 @@
 import React from 'react';
-import { StyleSheet, View, Text, TouchableOpacity, ScrollView, Dimensions } from 'react-native';
+import { StyleSheet, View, Text, TouchableOpacity, ScrollView, Dimensions, Alert } from 'react-native';
 import { FontAwesome } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
+import { usePartnerStore } from '../../src/store/usePartnerStore';
+import { useProductStore } from '../../src/store/useProductStore';
+import { useConfigStore } from '../../src/store/configStore';
 
 const { width } = Dimensions.get('window');
 const COLUMN_WIDTH = (width - 40) / 2; // Subtracting padding
@@ -40,7 +43,29 @@ export default function DashboardScreen() {
       color: '#10B9ff',
       route: '/(tabs)/configuracion',
     },
+    {
+      title: 'Sincronizar',
+      icon: 'refresh',
+      color: '#F59E0B',
+      action: 'sync',
+    },
   ];
+
+  const fetchPartners = usePartnerStore((state) => state.fetchPartners);
+  const fetchProducts = useProductStore((state) => state.fetchProducts);
+  const isOffline = useConfigStore((state) => state.isOffline);
+
+  const handleSync = async () => {
+    try {
+      console.log('Starting sync...');
+      await fetchPartners();
+      await fetchProducts();
+      Alert.alert('Éxito', 'Sincronización completada correctamente.');
+    } catch (error) {
+        console.error('Sync error:', error);
+        Alert.alert('Error', 'No se pudo sincronizar con Odoo.');
+    }
+  };
 
   return (
     <ScrollView style={styles.container}>
@@ -53,7 +78,13 @@ export default function DashboardScreen() {
           <TouchableOpacity
             key={index}
             style={[styles.card, { backgroundColor: item.color }]}
-            onPress={() => router.push(item.route as any)}
+            onPress={() => {
+                if (item.action === 'sync') {
+                    handleSync();
+                } else {
+                    router.push(item.route as any);
+                }
+            }}
           >
             <View style={styles.iconContainer}>
               <FontAwesome name={item.icon as any} size={40} color="#fff" />

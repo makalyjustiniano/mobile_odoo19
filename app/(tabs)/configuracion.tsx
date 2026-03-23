@@ -18,7 +18,11 @@ import { uploadOfflineChanges, backupAndPurgeDatabase } from '../../src/services
 import { printerService, PrinterDevice } from '../../src/services/printerService';
 
 export default function ConfiguracionScreen() {
-  const { profiles, activeProfileId, setProfileUrl, setActiveProfile, isOffline, toggleOffline } = useConfigStore();
+  const { profiles, activeProfileId, setActiveProfile, setProfileField, toggleOffline, isOffline } = useConfigStore();
+  
+  const handleFieldChange = (id: string, field: any, value: string) => {
+    setProfileField(id, field, value);
+  };
   const logout = useAuthStore((state) => state.logout);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [syncing, setSyncing] = useState(false);
@@ -272,17 +276,44 @@ export default function ConfiguracionScreen() {
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Perfiles de URL</Text>
           {profiles.map((profile) => (
-            <View key={profile.id} style={styles.inputGroup}>
-              <Text style={styles.label}>{profile.name}</Text>
+            <View key={profile.id} style={[styles.inputGroup, { borderBottomWidth: 1, borderBottomColor: '#eee', paddingBottom: 15 }]}>
+              <Text style={[styles.label, { fontWeight: 'bold', color: '#714B67' }]}>{profile.name}</Text>
+              
+              <Text style={styles.label}>URL Odoo</Text>
               <View style={styles.inputContainer}>
                 <FontAwesome name="globe" size={20} color="#9CA3AF" style={styles.icon} />
                 <TextInput
                   style={styles.input}
                   placeholder="https://tu-servidor.odoo.com"
                   value={profile.url}
-                  onChangeText={(text) => setProfileUrl(profile.id, text)}
+                  onChangeText={(text) => handleFieldChange(profile.id, 'url', text)}
                   autoCapitalize="none"
                   keyboardType="url"
+                />
+              </View>
+
+              <Text style={[styles.label, { marginTop: 10 }]}>Base de Datos</Text>
+              <View style={styles.inputContainer}>
+                <FontAwesome name="database" size={20} color="#9CA3AF" style={styles.icon} />
+                <TextInput
+                  style={styles.input}
+                  placeholder="nombre_db"
+                  value={profile.database}
+                  onChangeText={(text) => handleFieldChange(profile.id, 'database', text)}
+                  autoCapitalize="none"
+                />
+              </View>
+
+              <Text style={[styles.label, { marginTop: 10 }]}>Odoo API Key</Text>
+              <View style={styles.inputContainer}>
+                <FontAwesome name="key" size={20} color="#9CA3AF" style={styles.icon} />
+                <TextInput
+                  style={styles.input}
+                  placeholder="api_key_..."
+                  value={profile.apiKey}
+                  onChangeText={(text) => handleFieldChange(profile.id, 'apiKey', text)}
+                  autoCapitalize="none"
+                  secureTextEntry={false}
                 />
               </View>
             </View>

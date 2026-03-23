@@ -6,13 +6,15 @@ interface ConnectionProfile {
   id: string;
   name: string;
   url: string;
+  database: string;
+  apiKey: string;
 }
 
 interface ConfigState {
   profiles: ConnectionProfile[];
   activeProfileId: string;
   isOffline: boolean;
-  setProfileUrl: (id: string, url: string) => void;
+  setProfileField: (id: string, field: keyof ConnectionProfile, value: string) => void;
   setActiveProfile: (id: string) => void;
   getActiveProfile: () => ConnectionProfile | undefined;
   toggleOffline: () => void;
@@ -22,15 +24,15 @@ export const useConfigStore = create<ConfigState>()(
   persist(
     (set, get) => ({
       profiles: [
-        { id: '1', name: 'Conexión 1', url: 'https://brixy-staging-28261857.dev.odoo.com' },
-        { id: '2', name: 'Conexión 2', url: '' },
-        { id: '3', name: 'Conexión 3', url: '' },
+        { id: '1', name: 'Conexión 1', url: 'https://brixy-staging-28261857.dev.odoo.com', database: 'brixy-staging-28261857', apiKey: '' },
+        { id: '2', name: 'Conexión 2', url: '', database: '', apiKey: '' },
+        { id: '3', name: 'Conexión 3', url: '', database: '', apiKey: '' },
       ],
       activeProfileId: '1',
       isOffline: true,
 
-      setProfileUrl: (id, url) => set((state) => ({
-        profiles: state.profiles.map((p) => p.id === id ? { ...p, url } : p)
+      setProfileField: (id, field, value) => set((state) => ({
+        profiles: state.profiles.map((p) => p.id === id ? { ...p, [field]: value } : p)
       })),
 
       setActiveProfile: (id) => set({ activeProfileId: id }),

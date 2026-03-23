@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   StyleSheet,
   View,
@@ -24,11 +24,13 @@ export default function LoginScreen() {
   const router = useRouter();
   const login = useAuthStore((state) => state.login);
   const getActiveProfile = useConfigStore((state) => state.getActiveProfile);
+  const activeProfileId = useConfigStore((state) => state.activeProfileId);
+  const setProfileField = useConfigStore((state) => state.setProfileField);
   const activeProfile = getActiveProfile();
 
-  const [url, setUrl] = useState(activeProfile?.url || 'https://brixy-staging240226-28986359.dev.odoo.com');
-  const [apiKey, setApiKey] = useState('f5a38c3e56a878d1228745041c0bd105374134a6');
-  const [database, setDatabase] = useState('brixy-staging240226-28986359');
+  const [url, setUrl] = useState(activeProfile?.url || '');
+  const [apiKey, setApiKey] = useState(activeProfile?.apiKey || '');
+  const [database, setDatabase] = useState(activeProfile?.database || '');
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('Odo0Kr@l');
   const [loading, setLoading] = useState(false);
@@ -38,6 +40,15 @@ export default function LoginScreen() {
   const [syncMessage, setSyncMessage] = useState('');
   const [isAdvanced, setIsAdvanced] = useState(false);
 
+  // Sync state if active profile changes
+  useEffect(() => {
+    if (activeProfile) {
+      setUrl(activeProfile.url || '');
+      setApiKey(activeProfile.apiKey || '');
+      setDatabase(activeProfile.database || '');
+    }
+  }, [activeProfileId]);
+
   const handleLogin = async () => {
     setLoading(true);
     try {
@@ -46,8 +57,14 @@ export default function LoginScreen() {
       // Intentamos la autenticación real
       await testConnection2(url, database, username, password);
 
-      // Si tiene éxito, guardamos y navegamos
+      // Si tiene éxito, guardamos en Auth y actualizamos el Perfil activo
       login({ url, apiKey, database, username });
+      
+      if (activeProfileId) {
+        setProfileField(activeProfileId, 'url', url);
+        setProfileField(activeProfileId, 'database', database);
+        setProfileField(activeProfileId, 'apiKey', apiKey);
+      }
 
       // Sincronización Inicial
       setSyncing(true);

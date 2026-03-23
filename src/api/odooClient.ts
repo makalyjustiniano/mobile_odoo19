@@ -1,3 +1,4 @@
+import { Alert } from 'react-native';
 import { useAuthStore } from '../store/authStore';
 
 const FALLBACK_ODOO_URL = 'https://brixy-staging-28261857.dev.odoo.com';
@@ -60,6 +61,9 @@ export const callOdoo = async (
     return await response.json();
   } catch (error: any) {
     console.error(`Odoo API Error [${model}.${method}] ${url}:`, error.message);
+    if (!error.message.includes('aborted')) {
+        Alert.alert('Error de Conexión', `No se pudo conectar con Odoo: ${error.message}`);
+    }
     throw error;
   }
 };
