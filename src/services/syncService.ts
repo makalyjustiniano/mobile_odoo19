@@ -67,6 +67,32 @@ export const runSync = async (onProgress?: (msg: string) => void) => {
             company_ids: companyIds 
         };
 
+        // Pre-Sync Company Coords (Start of Route)
+        try {
+            const companyData: any = await callOdoo('res.company', 'read', {
+                ids: [companyId],
+                fields: ['partner_id']
+            });
+            if (companyData && companyData[0] && companyData[0].partner_id) {
+                const pid = companyData[0].partner_id[0];
+                const partnerData: any = await callOdoo('res.partner', 'read', {
+                    ids: [pid],
+                    fields: ['partner_latitude', 'partner_longitude']
+                });
+                if (partnerData && partnerData[0]) {
+                    useAuthStore.setState(prev => ({
+                        user: prev.user ? {
+                            ...prev.user,
+                            company_latitude: partnerData[0].partner_latitude,
+                            company_longitude: partnerData[0].partner_longitude
+                        } : null
+                    }));
+                }
+            }
+        } catch (e) {
+            console.warn('Could not fetch company coordinates');
+        }
+
         console.log('--- DIAGNÓSTICO DE SINCRONIZACIÓN ---');
         console.log('User UID:', baseUser.uid);
         console.log('Company IDs:', JSON.stringify(baseUser.company_ids));
@@ -134,7 +160,8 @@ export const runSync = async (onProgress?: (msg: string) => void) => {
             fields: [
                 'name', 'partner_id', 'move_type', 'state', 'payment_state',
                 'invoice_date', 'invoice_date_due', 'amount_total',
-                'amount_residual', 'invoice_line_ids', 'invoice_user_id', 'company_id'
+                'amount_residual', 'invoice_line_ids', 'invoice_user_id', 'company_id',
+                'siat_estado', 'siat_qr_string', 'siat_qr_image', 'siat_cuf'
             ],
             limit: 200
         });
@@ -151,7 +178,8 @@ export const runSync = async (onProgress?: (msg: string) => void) => {
                 fields: [
                     'name', 'partner_id', 'move_type', 'state', 'payment_state',
                     'invoice_date', 'invoice_date_due', 'amount_total',
-                    'amount_residual', 'invoice_line_ids', 'invoice_user_id', 'company_id'
+                    'amount_residual', 'invoice_line_ids', 'invoice_user_id', 'company_id',
+                    'siat_estado', 'siat_qr_string', 'siat_qr_image', 'siat_cuf'
                 ],
                 limit: saleInvoiceIds.length
             });

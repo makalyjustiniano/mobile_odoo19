@@ -39,6 +39,12 @@ export default function DashboardScreen() {
       route: '/(tabs)/cobranzas',
     },
     {
+      title: 'Cartera',
+      icon: 'folder-open',
+      color: '#714B67',
+      route: '/(tabs)/cartera',
+    },
+    {
       title: 'Configuración',
       icon: 'cog',
       color: '#10B9ff',

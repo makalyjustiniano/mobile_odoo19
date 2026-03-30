@@ -101,6 +101,15 @@ export default function TabLayout() {
             />
 
             <Tabs.Screen
+                name="cartera"
+                options={{
+                    title: 'Cartera',
+                    href: permissions?.view_receivables ? undefined : null,
+                    tabBarIcon: ({ color }) => <FontAwesome name="folder-open" size={24} color={color} />,
+                }}
+            />
+
+            <Tabs.Screen
                 name="inventario"
                 options={{
                     title: 'Inventario',

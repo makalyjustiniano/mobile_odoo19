@@ -106,7 +106,7 @@ export default function InventarioScreen() {
                 <View style={{ flex: 1 }}>
                     <Text style={styles.code}>{item.default_code || 'Sin Código'}</Text>
                     <Text style={styles.name}>{item.display_name}</Text>
-                    <Text style={styles.uom}>{item.uom_id[1]}</Text>
+                    <Text style={styles.uom}>{item.uom_id ? item.uom_id[1] : ''}</Text>
                 </View>
                 <View style={styles.priceContainer}>
                     <Text style={styles.priceValue}>{item.list_price.toFixed(2)}</Text>

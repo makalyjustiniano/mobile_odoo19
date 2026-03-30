@@ -12,6 +12,8 @@ interface AuthUser {
   company_id?: number;
   company_ids?: number[];
   company_name?: string;
+  company_latitude?: number;
+  company_longitude?: number;
   permissions?: any;
 }
 

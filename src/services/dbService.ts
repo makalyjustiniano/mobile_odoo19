@@ -276,9 +276,11 @@ export const initDB = async () => {
                 }
             }
 
-            if (table === 'sale_orders') {
-                await addColumnIfMissing(table, 'invoice_id', "INTEGER");
+            if (table === 'sale_orders' || table === 'stock_moves') {
                 await addColumnIfMissing(table, 'partner_id', "INTEGER");
+                if (table === 'sale_orders') {
+                    await addColumnIfMissing(table, 'invoice_id', "INTEGER");
+                }
             }
             if (table === 'account_moves') {
                 await addColumnIfMissing(table, 'partner_id', "INTEGER");
@@ -699,6 +701,18 @@ export const getAccountMoves = async () => {
     return moves;
 };
 
+export const getAccountMoveLines = async (moveId: number) => {
+    await initDB();
+    const db = await getDb();
+    const rows: any[] = await db.getAllAsync('SELECT * FROM account_move_lines WHERE move_id = ?', [moveId]);
+    return rows.map(r => ({
+        ...r,
+        product_id: [0, r.product_name || ''],
+        product_uom_id: [0, r.uom_name || '']
+    }));
+};
+
+
 // Stock Moves (Distribucion)
 export const saveStockMoves = async (moves: any[]) => {
     await initDB();
@@ -709,8 +723,8 @@ export const saveStockMoves = async (moves: any[]) => {
     try {
         for (const m of moves) {
             await db.runAsync(
-                `INSERT OR REPLACE INTO stock_moves (id, picking_id, reference, product_name, product_uom_qty, uom_name, state, origin, partner_name, date, date_deadline, pending_delivery_qty, pending_delivery_date, company_id, user_id, user_name) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                `INSERT OR REPLACE INTO stock_moves (id, picking_id, reference, product_name, product_uom_qty, uom_name, state, origin, partner_id, partner_name, date, date_deadline, pending_delivery_qty, pending_delivery_date, company_id, user_id, user_name) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
                     m.id || 0,
                     extractId(m.picking_id),
@@ -720,6 +734,7 @@ export const saveStockMoves = async (moves: any[]) => {
                     Array.isArray(m.product_uom) ? m.product_uom[1] : '',
                     m.state || '',
                     m.origin || '',
+                    extractId(m.partner_id),
                     Array.isArray(m.partner_id) ? m.partner_id[1] : '',
                     m.date || '',
                     m.date_deadline || '',
@@ -764,7 +779,7 @@ export const getStockMoves = async () => {
         m.lines = await db.getAllAsync('SELECT * FROM stock_move_lines WHERE move_id = ?', [m.id]);
         m.product_id = [0, m.product_name];
         m.product_uom = [0, m.uom_name];
-        m.partner_id = [0, m.partner_name];
+        m.partner_id = m.partner_id ? [m.partner_id, m.partner_name] : [0, m.partner_name];
         // Enforce user_name availability for UI
         if (!m.user_name && m.user_id) m.user_name = `Responsable ID: ${m.user_id}`;
         for (const l of m.lines) {
@@ -776,6 +791,25 @@ export const getStockMoves = async () => {
         }
     }
     return moves;
+};
+
+export const getStockMovesWithCoords = async () => {
+    await initDB();
+    const db = await getDb();
+    const query = `
+        SELECT sm.*, p.partner_latitude, p.partner_longitude
+        FROM stock_moves sm
+        LEFT JOIN partners p ON sm.partner_id = p.id
+        WHERE sm.state NOT IN ('done', 'cancel')
+    `;
+    const rows: any[] = await db.getAllAsync(query);
+    return rows.map(m => ({
+        ...m,
+        picking_id: m.picking_id ? [m.picking_id, m.reference] : false,
+        partner_id: m.partner_id ? [m.partner_id, m.partner_name] : [0, m.partner_name],
+        latitude: m.partner_latitude,
+        longitude: m.partner_longitude
+    }));
 };
 
 export const queueStockMoveDelivery = async (moveId: number, pickingId: number, deliveredQty: number) => {

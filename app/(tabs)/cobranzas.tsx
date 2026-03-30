@@ -48,6 +48,7 @@ interface AccountMove {
     amount_total: number;
     amount_residual: number;
     invoice_line_ids: number[];
+    invoice_user_id: [number, string];
     // UI state
     expanded?: boolean;
     lines?: AccountMoveLine[];
@@ -323,6 +324,10 @@ export default function CobranzasScreen() {
                             <FontAwesome name="user" size={12} color="#00A09D" />
                             <Text style={styles.clientName}>{item.partner_id[1]}</Text>
                         </View>
+                        <View style={styles.userSmallRow}>
+                            <FontAwesome name="user-circle" size={10} color="#6B7280" />
+                            <Text style={styles.userNameText}> {item.invoice_user_id ? item.invoice_user_id[1] : ''}</Text>
+                        </View>
                     </View>
                     <View style={styles.amountContainer}>
                         <Text style={styles.residualLabel}>A COBRAR</Text>
@@ -588,6 +593,16 @@ const styles = StyleSheet.create({
         color: '#00A09D',
         fontWeight: '600',
         marginLeft: 6,
+    },
+    userSmallRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        marginTop: 2,
+    },
+    userNameText: {
+        fontSize: 11,
+        color: '#6B7280',
+        fontStyle: 'italic',
     },
     amountContainer: {
         alignItems: 'flex-end',
