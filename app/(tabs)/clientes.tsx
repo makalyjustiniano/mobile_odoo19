@@ -8,8 +8,11 @@ import {
   TextInput,
   Alert,
   ActivityIndicator,
-  Image
+  Image,
+  Dimensions
 } from 'react-native';
+import MapView, { Marker, PROVIDER_GOOGLE } from 'react-native-maps';
+import * as Location from 'expo-location';
 import { FontAwesome } from '@expo/vector-icons';
 import { callOdoo } from '../../src/api/odooClient';
 import { useEffect, useState } from 'react';
@@ -74,6 +77,23 @@ export default function Index() {
   const [editPagoProveedor, setEditPagoProveedor] = useState('');
   const [editPagoCliente, setEditPagoCliente] = useState('');
   const [editTipoDocumento, setEditTipoDocumento] = useState('');
+  
+  // Map/Location States
+  const [mapModalVisible, setMapModalVisible] = useState(false);
+  const [currentLat, setCurrentLat] = useState<number | null>(null);
+  const [currentLng, setCurrentLng] = useState<number | null>(null);
+  const [tempLat, setTempLat] = useState<number | null>(null);
+  const [tempLng, setTempLng] = useState<number | null>(null);
+  const [mapMode, setMapMode] = useState<'create' | 'edit' | 'view'>('create');
+  
+  // Advanced Map Options
+  const [searchAddress, setSearchAddress] = useState('');
+  const [mapRegion, setMapRegion] = useState({
+    latitude: -16.5000,
+    longitude: -68.1500,
+    latitudeDelta: 0.02,
+    longitudeDelta: 0.02,
+  });
 
   const fetchPartners = async () => {
     try {
@@ -101,7 +121,7 @@ export default function Index() {
               "comment", "image_128", 
               "x_studio_razon_social", "x_studio_complemento", "x_studio_giro",
               "x_studio_pago_a_proveedor", "x_studio_pago_de_cliente", "x_studio_tipo_de_documento",
-              "user_id", "company_id"
+              "user_id", "company_id", "partner_latitude", "partner_longitude"
             ],
             limit: 200
           }, true);
@@ -134,7 +154,9 @@ export default function Index() {
         await db.createPartnerLocal({
           display_name: newName,
           email: newEmail,
-          phone: newPhone
+          phone: newPhone,
+          partner_latitude: currentLat,
+          partner_longitude: currentLng
         });
         Alert.alert('Modo Offline', 'Cliente guardado localmente.');
       } else {
@@ -142,7 +164,9 @@ export default function Index() {
           vals_list: [{
             name: newName,
             email: newEmail,
-            phone: newPhone
+            phone: newPhone,
+            partner_latitude: currentLat,
+            partner_longitude: currentLng
           }]
         });
         Alert.alert('Éxito', 'Cliente registrado en Odoo.');
@@ -183,11 +207,15 @@ export default function Index() {
         x_studio_giro: editGiro,
         x_studio_pago_a_proveedor: editPagoProveedor,
         x_studio_pago_de_cliente: editPagoCliente,
-        x_studio_tipo_de_documento: editTipoDocumento
+        x_studio_tipo_de_documento: editTipoDocumento,
+        partner_latitude: currentLat,
+        partner_longitude: currentLng
       };
 
+      // INMEDIATAMENTE actualizamos la DB local para consistencia visual (sin esperar a Odoo)
+      await db.updatePartnerLocal(updatedData);
+
       if (isOffline) {
-        await db.updatePartnerLocal(updatedData);
         Alert.alert('Modo Offline', 'Cambios guardados localmente.');
       } else {
         await callOdoo('res.partner', 'write', {
@@ -205,20 +233,110 @@ export default function Index() {
                 x_studio_giro: editGiro,
                 x_studio_pago_a_proveedor: editPagoProveedor,
                 x_studio_pago_de_cliente: editPagoCliente,
-                x_studio_tipo_de_documento: editTipoDocumento
+                x_studio_tipo_de_documento: editTipoDocumento,
+                partner_latitude: currentLat,
+                partner_longitude: currentLng
             }
         });
         Alert.alert('Éxito', 'Cliente actualizado en Odoo.');
       }
 
+      // Actualizamos estado en memoria inmediatamente
+      setResult(prev => prev.map(p => p.id === selectedPartner.id ? { ...p, ...updatedData } : p));
+
       setIsEditing(false);
       setDetailModalVisible(false);
+      
+      // Sincronizamos silenciosamente de fondo
       fetchPartners();
     } catch (error: any) {
       Alert.alert('Error', 'No se pudo actualizar: ' + error.message);
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleGetLocation = async () => {
+    try {
+      setLoading(true);
+      let { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert('Permiso denegado', 'Se requiere acceso a la ubicación para capturar coordenadas.');
+        return;
+      }
+
+      let location = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+      setCurrentLat(location.coords.latitude);
+      setCurrentLng(location.coords.longitude);
+      setTempLat(location.coords.latitude);
+      setTempLng(location.coords.longitude);
+      
+      Alert.alert('Éxito', 'Ubicación capturada correctamente.');
+    } catch (e: any) {
+      Alert.alert('Error', 'No se pudo obtener la ubicación: ' + e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleOpenMap = (mode: 'create' | 'edit' | 'view') => {
+    setMapMode(mode);
+    setTempLat(currentLat);
+    setTempLng(currentLng);
+    setSearchAddress('');
+    
+    if (currentLat && currentLng) {
+      setMapRegion({ latitude: currentLat, longitude: currentLng, latitudeDelta: 0.005, longitudeDelta: 0.005 });
+    } else {
+      setMapRegion({ latitude: -16.5000, longitude: -68.1500, latitudeDelta: 0.05, longitudeDelta: 0.05 }); // La Paz default
+    }
+    
+    setMapModalVisible(true);
+  };
+
+  const handleSearchLocation = async () => {
+    if (!searchAddress.trim()) return;
+    try {
+      setLoading(true);
+      const results = await Location.geocodeAsync(searchAddress);
+      if (results && results.length > 0) {
+        const { latitude, longitude } = results[0];
+        setTempLat(latitude);
+        setTempLng(longitude);
+        setMapRegion({ latitude, longitude, latitudeDelta: 0.005, longitudeDelta: 0.005 });
+      } else {
+        Alert.alert('Sin resultados', 'No se encontró la dirección indicada.');
+      }
+    } catch (e: any) {
+      Alert.alert('Error', 'No se pudo buscar la dirección.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCenterOnMeMap = async () => {
+    try {
+      setLoading(true);
+      let { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted') return;
+      let location = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+      const { latitude, longitude } = location.coords;
+      setTempLat(latitude);
+      setTempLng(longitude);
+      setMapRegion({ latitude, longitude, latitudeDelta: 0.005, longitudeDelta: 0.005 });
+    } catch (e: any) {
+      Alert.alert('Error', 'No se pudo obtener tu posición.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleConfirmMapLocation = () => {
+    if (tempLat && tempLng) {
+      setCurrentLat(tempLat);
+      setCurrentLng(tempLng);
+    }
+    setMapModalVisible(false);
   };
 
   const openDetails = (partner: Partner) => {
@@ -236,6 +354,8 @@ export default function Index() {
     setEditPagoProveedor(partner.x_studio_pago_a_proveedor || '');
     setEditPagoCliente(partner.x_studio_pago_de_cliente || '');
     setEditTipoDocumento(partner.x_studio_tipo_de_documento || '');
+    setCurrentLat(partner.partner_latitude || null);
+    setCurrentLng(partner.partner_longitude || null);
     setIsEditing(false);
     setDetailModalVisible(true);
   };
@@ -275,7 +395,7 @@ export default function Index() {
                         <FontAwesome name="id-card" size={12} color="#6B7280" />
                         <Text style={styles.infoText}>{partner.vat || 'Sin NIT/CI'}</Text>
                     </View>
-                    {partner.phone && (
+                    {!!partner.phone && (
                         <View style={styles.infoRow}>
                             <FontAwesome name="phone" size={12} color="#6B7280" />
                             <Text style={styles.infoText}>{partner.phone}</Text>
@@ -306,6 +426,18 @@ export default function Index() {
               <Text style={styles.label}>Teléfono</Text>
               <TextInput style={styles.input} value={newPhone} onChangeText={setNewPhone} placeholder="+591 ..." keyboardType="phone-pad" />
               
+              <Text style={styles.label}>Ubicación (Lat: {currentLat?.toFixed(4) || 'N/D'}, Lng: {currentLng?.toFixed(4) || 'N/D'})</Text>
+              <View style={{ flexDirection: 'row', gap: 10, marginBottom: 15 }}>
+                <TouchableOpacity style={[styles.locationBtn, { flex: 1 }]} onPress={handleGetLocation}>
+                  <FontAwesome name="location-arrow" size={14} color="#fff" />
+                  <Text style={styles.locationBtnText}> MI POSICIÓN</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={[styles.locationBtn, { flex: 1, backgroundColor: '#714B67' }]} onPress={() => handleOpenMap('create')}>
+                  <FontAwesome name="map" size={14} color="#fff" />
+                  <Text style={styles.locationBtnText}> BUSCAR EN MAPA</Text>
+                </TouchableOpacity>
+              </View>
+
               <TouchableOpacity style={styles.saveBtn} onPress={handleSavePartner} disabled={loading}>
                 {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.saveBtnText}>GUARDAR CLIENTE</Text>}
               </TouchableOpacity>
@@ -332,12 +464,12 @@ export default function Index() {
               </View>
             </View>
             
-            {selectedPartner && (
+            {!!selectedPartner && (
               <ScrollView style={styles.modalBody}>
                 {!isEditing && (
                   <View style={styles.detailHeader}>
                     <View style={styles.largeAvatar}>
-                      {selectedPartner.image_128 ? (
+                      {!!selectedPartner.image_128 ? (
                         <Image 
                           source={{ uri: `data:image/png;base64,${selectedPartner.image_128}` }} 
                           style={styles.largeAvatarImage} 
@@ -347,7 +479,7 @@ export default function Index() {
                       )}
                     </View>
                     <Text style={styles.detailName}>{selectedPartner.display_name}</Text>
-                    {selectedPartner.x_studio_razon_social && (
+                    {!!selectedPartner.x_studio_razon_social && (
                       <Text style={styles.detailSub}>{selectedPartner.x_studio_razon_social}</Text>
                     )}
                   </View>
@@ -390,7 +522,7 @@ export default function Index() {
                   ) : (
                     <>
                       <DetailRow icon="map-marker" label="Calle" value={selectedPartner.street} />
-                      {selectedPartner.street2 && <DetailRow icon="map-marker" label="Calle 2" value={selectedPartner.street2} />}
+                      {!!selectedPartner.street2 && <DetailRow icon="map-marker" label="Calle 2" value={selectedPartner.street2} />}
                       <DetailRow icon="building" label="Ciudad" value={selectedPartner.city} />
                       <DetailRow icon="envelope-o" label="Código Postal" value={selectedPartner.zip} />
                     </>
@@ -409,7 +541,7 @@ export default function Index() {
                   </View>
                 )}
 
-                {!isEditing && selectedPartner.comment && (
+                {!isEditing && !!selectedPartner.comment && (
                   <View style={styles.section}>
                     <Text style={styles.sectionTitle}>NOTAS</Text>
                     <Text style={styles.commentText}>{selectedPartner.comment}</Text>
@@ -419,7 +551,7 @@ export default function Index() {
                 <View style={styles.section}>
                   <Text style={styles.sectionTitle}>CAMPOS PERSONALIZADOS (STUDIO)</Text>
                   {isEditing ? (
-                    <>
+                    <View>
                       <Text style={styles.label}>Razón Social</Text>
                       <TextInput style={styles.input} value={editRazonSocial} onChangeText={setEditRazonSocial} />
                       <Text style={styles.label}>Complemento</Text>
@@ -432,16 +564,36 @@ export default function Index() {
                       <TextInput style={styles.input} value={editPagoProveedor} onChangeText={setEditPagoProveedor} />
                       <Text style={styles.label}>Pago de Cliente</Text>
                       <TextInput style={styles.input} value={editPagoCliente} onChangeText={setEditPagoCliente} />
-                    </>
+                      <Text style={styles.label}>Ubicación (Lat: {currentLat?.toFixed(4) || 'N/D'}, Lng: {currentLng?.toFixed(4) || 'N/D'})</Text>
+                      <View style={{ flexDirection: 'row', gap: 10, marginBottom: 15 }}>
+                        <TouchableOpacity style={[styles.locationBtn, { flex: 1, backgroundColor: '#00A09D' }]} onPress={handleGetLocation}>
+                          <FontAwesome name="location-arrow" size={14} color="#fff" />
+                          <Text style={styles.locationBtnText}> MI POSICIÓN</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={[styles.locationBtn, { flex: 1, backgroundColor: '#714B67' }]} onPress={() => handleOpenMap('edit')}>
+                          <FontAwesome name="map" size={14} color="#fff" />
+                          <Text style={styles.locationBtnText}> BUSCAR EN MAPA</Text>
+                        </TouchableOpacity>
+                      </View>
+                    </View>
                   ) : (
-                    <>
+                    <View>
                       <DetailRow icon="briefcase" label="Razón Social" value={selectedPartner.x_studio_razon_social} />
                       <DetailRow icon="plus-square" label="Complemento" value={selectedPartner.x_studio_complemento} />
                       <DetailRow icon="industry" label="Giro" value={selectedPartner.x_studio_giro} />
                       <DetailRow icon="file-text-o" label="Tipo de Documento" value={selectedPartner.x_studio_tipo_de_documento} />
                       <DetailRow icon="money" label="Pago a Proveedor" value={selectedPartner.x_studio_pago_a_proveedor} />
                       <DetailRow icon="credit-card" label="Pago de Cliente" value={selectedPartner.x_studio_pago_de_cliente} />
-                    </>
+                      <Text style={[styles.sectionTitle, { marginTop: 15 }]}>UBICACIÓN</Text>
+                      <DetailRow icon="globe" label="Latitud" value={selectedPartner.partner_latitude?.toString()} />
+                      <DetailRow icon="globe" label="Longitud" value={selectedPartner.partner_longitude?.toString()} />
+                      {(selectedPartner.partner_latitude != null && selectedPartner.partner_longitude != null) && (
+                        <TouchableOpacity style={[styles.locationBtn, { marginTop: 10 }]} onPress={() => handleOpenMap('view')}>
+                          <FontAwesome name="map-marker" size={14} color="#fff" />
+                          <Text style={styles.locationBtnText}> VER EN MAPA</Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
                   )}
                 </View>
 
@@ -455,6 +607,70 @@ export default function Index() {
               </ScrollView>
             )}
           </View>
+        </View>
+      </Modal>
+
+      {/* MODAL SELECCION EN MAPA */}
+      <Modal visible={mapModalVisible} animationType="slide">
+        <View style={{ flex: 1 }}>
+          <View style={[styles.modalHeader, { paddingHorizontal: 20, paddingTop: 50, backgroundColor: '#fff', marginBottom: 0 }]}>
+            <Text style={styles.modalTitle}>
+              {mapMode === 'view' ? 'Ubicación del Cliente' : 'Seleccionar Ubicación'}
+            </Text>
+            <TouchableOpacity onPress={() => setMapModalVisible(false)}>
+              <FontAwesome name="times" size={24} color="#6B7280" />
+            </TouchableOpacity>
+          </View>
+          
+          {mapMode !== 'view' && (
+            <View style={{ padding: 10, paddingHorizontal: 20, backgroundColor: '#fff', flexDirection: 'row', alignItems: 'center', gap: 10, zIndex: 10, elevation: 3 }}>
+              <TextInput 
+                style={[styles.input, { flex: 1, marginBottom: 0, height: 45, backgroundColor: '#F3F4F6', borderColor: '#E5E7EB' }]} 
+                placeholder="Buscar por dirección..."
+                value={searchAddress}
+                onChangeText={setSearchAddress}
+                onSubmitEditing={handleSearchLocation}
+              />
+              <TouchableOpacity style={{ backgroundColor: '#714B67', padding: 12, borderRadius: 8, height: 45, justifyContent: 'center', alignItems: 'center' }} onPress={handleSearchLocation}>
+                {loading ? <ActivityIndicator size="small" color="#fff" /> : <FontAwesome name="search" size={16} color="#fff" />}
+              </TouchableOpacity>
+              <TouchableOpacity style={{ backgroundColor: '#00A09D', padding: 12, borderRadius: 8, height: 45, justifyContent: 'center', alignItems: 'center' }} onPress={handleCenterOnMeMap}>
+                {loading ? <ActivityIndicator size="small" color="#fff" /> : <FontAwesome name="crosshairs" size={18} color="#fff" />}
+              </TouchableOpacity>
+            </View>
+          )}
+
+          <MapView
+            style={styles.mapStyles}
+            showsUserLocation={true}
+            showsMyLocationButton={false}
+            region={mapRegion}
+            onRegionChangeComplete={(region) => setMapRegion(region)}
+            onPress={(e) => {
+              if (mapMode !== 'view') {
+                setTempLat(e.nativeEvent.coordinate.latitude);
+                setTempLng(e.nativeEvent.coordinate.longitude);
+              }
+            }}
+          >
+            {(tempLat != null && tempLng != null) && (
+              <Marker
+                coordinate={{ latitude: tempLat, longitude: tempLng }}
+                title="Ubicación Seleccionada"
+                draggable={mapMode !== 'view'}
+                onDragEnd={(e) => {
+                  setTempLat(e.nativeEvent.coordinate.latitude);
+                  setTempLng(e.nativeEvent.coordinate.longitude);
+                }}
+              />
+            )}
+          </MapView>
+
+          {mapMode !== 'view' && (
+            <TouchableOpacity style={styles.confirmMapBtn} onPress={handleConfirmMapLocation}>
+              <Text style={styles.saveBtnText}>CONFIRMAR UBICACIÓN</Text>
+            </TouchableOpacity>
+          )}
         </View>
       </Modal>
     </View>
@@ -724,5 +940,34 @@ const styles = StyleSheet.create({
     color: '#4B5563',
     lineHeight: 20,
     fontStyle: 'italic'
+  },
+  // LOCATION STYLES
+  locationBtn: {
+    backgroundColor: '#00A09D',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 10,
+    borderRadius: 8,
+  },
+  locationBtnText: {
+    color: '#fff',
+    fontWeight: 'bold',
+    fontSize: 12,
+  },
+  mapStyles: {
+    flex: 1,
+    width: '100%',
+  },
+  confirmMapBtn: {
+    position: 'absolute',
+    bottom: 30,
+    left: 20,
+    right: 20,
+    backgroundColor: '#00A09D',
+    padding: 15,
+    borderRadius: 12,
+    alignItems: 'center',
+    elevation: 5,
   }
 });

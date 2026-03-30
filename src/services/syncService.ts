@@ -86,7 +86,8 @@ export const runSync = async (onProgress?: (msg: string) => void) => {
                 "comment", "image_128", "company_id", "user_id",
                 "x_studio_complemento", "x_studio_giro", 
                 "x_studio_pago_a_proveedor", "x_studio_pago_de_cliente", 
-                "x_studio_razon_social", "x_studio_tipo_de_documento"
+                "x_studio_razon_social", "x_studio_tipo_de_documento",
+                "partner_latitude", "partner_longitude"
             ],
             limit: 500
         });
@@ -337,6 +338,8 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
                         name: p.display_name,
                         email: p.email,
                         phone: p.phone,
+                        partner_latitude: p.partner_latitude || 0,
+                        partner_longitude: p.partner_longitude || 0
                     }]
                 }, true);
                 // Extract ID from Odoo response
@@ -359,7 +362,9 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
                         x_studio_giro: p.x_studio_giro,
                         x_studio_pago_a_proveedor: p.x_studio_pago_a_proveedor,
                         x_studio_pago_de_cliente: p.x_studio_pago_de_cliente,
-                        x_studio_tipo_de_documento: p.x_studio_tipo_de_documento
+                        x_studio_tipo_de_documento: p.x_studio_tipo_de_documento,
+                        partner_latitude: p.partner_latitude || 0,
+                        partner_longitude: p.partner_longitude || 0
                     }
                 }, true);
                 await db.markSynced('partners', p.id, p.id);

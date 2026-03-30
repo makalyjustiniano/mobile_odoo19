@@ -96,6 +96,8 @@ export const initDB = async () => {
             image_128 TEXT,
             company_id INTEGER,
             user_id INTEGER,
+            partner_latitude REAL,
+            partner_longitude REAL,
             metadata TEXT,
             sync_status TEXT DEFAULT 'synced',
             is_local INTEGER DEFAULT 0
@@ -319,6 +321,8 @@ export const initDB = async () => {
                 await addColumnIfMissing(table, 'x_studio_tipo_de_documento', "TEXT");
                 await addColumnIfMissing(table, 'image_128', "TEXT");
                 await addColumnIfMissing(table, 'metadata', "TEXT");
+                await addColumnIfMissing(table, 'partner_latitude', "REAL");
+                await addColumnIfMissing(table, 'partner_longitude', "REAL");
             }
         }
     })();
@@ -331,8 +335,8 @@ export const createPartnerLocal = async (partner: any) => {
     const db = await getDb();
     const localId = -Math.floor(Date.now() / 1000); // Temporary negative ID
     await db.runAsync(
-        `INSERT INTO partners (id, display_name, email, phone, sync_status, is_local) VALUES (?, ?, ?, ?, 'new', 1)`,
-        [localId, partner.display_name, partner.email || '', partner.phone || '']
+        `INSERT INTO partners (id, display_name, email, phone, sync_status, is_local, partner_latitude, partner_longitude) VALUES (?, ?, ?, ?, 'new', 1, ?, ?)`,
+        [localId, partner.display_name, partner.email || '', partner.phone || '', partner.partner_latitude || 0, partner.partner_longitude || 0]
     );
     return localId;
 };
@@ -350,6 +354,7 @@ export const updatePartnerLocal = async (partner: any) => {
             street = ?, city = ?, zip = ?, 
             x_studio_razon_social = ?, x_studio_complemento = ?, x_studio_giro = ?,
             x_studio_pago_a_proveedor = ?, x_studio_pago_de_cliente = ?, x_studio_tipo_de_documento = ?,
+            partner_latitude = ?, partner_longitude = ?,
             sync_status = ? 
          WHERE id = ?`,
         [
@@ -357,6 +362,7 @@ export const updatePartnerLocal = async (partner: any) => {
             partner.street || '', partner.city || '', partner.zip || '',
             partner.x_studio_razon_social || '', partner.x_studio_complemento || '', partner.x_studio_giro || '',
             partner.x_studio_pago_a_proveedor || '', partner.x_studio_pago_de_cliente || '', partner.x_studio_tipo_de_documento || '',
+            partner.partner_latitude || 0, partner.partner_longitude || 0,
             newSyncStatus, partner.id
         ]
     );
@@ -469,8 +475,8 @@ export const savePartners = async (partners: any[]) => {
                     comment, x_studio_razon_social, 
                     x_studio_complemento, x_studio_giro, x_studio_pago_a_proveedor, 
                     x_studio_pago_de_cliente, x_studio_tipo_de_documento,
-                    image_128, company_id, user_id, metadata
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    image_128, company_id, user_id, partner_latitude, partner_longitude, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
                     p.id || 0,
                     p.display_name || '',
@@ -497,6 +503,8 @@ export const savePartners = async (partners: any[]) => {
                     p.image_128 || '',
                     Array.isArray(p.company_id) ? p.company_id[0] : (p.company_id || 0),
                     Array.isArray(p.user_id) ? p.user_id[0] : (p.user_id || 0),
+                    p.partner_latitude || 0,
+                    p.partner_longitude || 0,
                     p.id ? JSON.stringify(p) : ''
                 ]
             );
