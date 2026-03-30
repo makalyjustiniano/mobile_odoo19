@@ -18,6 +18,8 @@ import { callOdoo } from '../../src/api/odooClient';
 import { useConfigStore } from '../../src/store/configStore';
 import * as db from '../../src/services/dbService';
 import { runSync, submitPickingDelivery } from '../../src/services/syncService';
+import { getSiatDomain } from '../../src/utils/permissionUtils';
+import { useAuthStore } from '../../src/store/authStore';
 
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
     UIManager.setLayoutAnimationEnabledExperimental(true);
@@ -36,6 +38,7 @@ interface StockMove {
     date: string;
     date_deadline?: string;
     pending_delivery_qty?: number | null;
+    user_name?: string;
 }
 
 type ViewMode = 'client' | 'product';
@@ -47,6 +50,7 @@ interface DeliveryGroup {
     partnerName: string;
     origin: string;
     scheduledDate: string;
+    userName: string;
     moves: StockMove[];
 }
 
@@ -62,6 +66,7 @@ const getRemainingQty = (move: StockMove, qtyMap: Record<number, string>) => {
 };
 
 export default function DistribucionScreen() {
+    const user = useAuthStore((state) => state.user);
     const [moves, setMoves] = useState<StockMove[]>([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
@@ -74,35 +79,52 @@ export default function DistribucionScreen() {
     const fetchMoves = async () => {
         try {
             await db.initDB();
-            setLoading(true);
+            if (!refreshing) setLoading(true);
 
-            if (isOffline) {
-                const localData = await db.getStockMoves();
-                setMoves(localData as any);
-                return;
+            // 1. CARGA INSTANTÁNEA (Offline-First por defecto)
+            console.log('Cargando distribución desde SQLite...');
+            const localData = await db.getStockMoves();
+            setMoves(localData as any);
+            if (localData && localData.length > 0) setLoading(false);
+
+            // 2. ACTUALIZACIÓN EN SEGUNDO PLANO (Si online)
+            if (!isOffline) {
+                console.log('Refrescando movimientos de stock desde Odoo...');
+                try {
+                    const stockDomain = getSiatDomain('stock.move', user);
+                    
+                    // Combinamos con filtros específicos de movimientos pendientes
+                    const fullDomain = [
+                        '&',
+                        ...stockDomain,
+                        '&',
+                        ['partner_id', '!=', false],
+                        ['state', 'in', ['draft', 'waiting', 'confirmed', 'partially_available', 'assigned']]
+                    ];
+
+                    const result: any[] = await callOdoo('stock.move', 'search_read', {
+                        domain: fullDomain,
+                        fields: [
+                            'picking_id', 'reference', 'product_id', 'product_uom_qty', 'product_uom',
+                            'state', 'origin', 'partner_id', 'date', 'date_deadline', 'company_id'
+                        ],
+                        limit: 300
+                    }, true);
+
+                    if (result && Array.isArray(result)) {
+                        // All results from Odoo are already filtered by the current user in the domain
+                        result.forEach(m => {
+                            m.user_id = user?.uid || 0;
+                            m.user_name = user?.name || '';
+                        });
+                        await db.saveStockMoves(result as any);
+                        const updatedLocal = await db.getStockMoves();
+                        setMoves(updatedLocal as any);
+                    }
+                } catch (e) {
+                    console.warn('No se pudo refrescar distribución de Odoo.');
+                }
             }
-
-            const result = await callOdoo('stock.move', 'search_read', {
-                domain: [
-                    ['picking_code', '=', 'outgoing'],
-                    ['partner_id', '!=', false],
-                    ['state', 'in', ['draft', 'waiting', 'confirmed', 'partially_available', 'assigned']]
-                ],
-                fields: [
-                    'picking_id',
-                    'reference',
-                    'product_id',
-                    'product_uom_qty',
-                    'product_uom',
-                    'state',
-                    'origin',
-                    'partner_id',
-                    'date',
-                    'date_deadline'
-                ],
-                limit: 500
-            });
-            setMoves(result as StockMove[]);
         } catch (error) {
             console.error('Error fetching delivery moves:', error);
         } finally {
@@ -129,6 +151,7 @@ export default function DistribucionScreen() {
                     partnerName: Array.isArray(move.partner_id) ? move.partner_id[1] : 'Cliente No Definido',
                     origin: move.origin || 'N/A',
                     scheduledDate: move.date_deadline || move.date,
+                    userName: move.user_name || user?.name || 'Asignado',
                     moves: []
                 });
             }
@@ -252,6 +275,7 @@ export default function DistribucionScreen() {
                             <View style={styles.refRow}>
                                 <FontAwesome name="truck" size={14} color="#714B67" />
                                 <Text style={styles.reference}>{item.reference}</Text>
+                                <Text style={styles.responsible}>({item.userName})</Text>
                             </View>
                             <View style={styles.dateBadge}>
                                 <FontAwesome name="calendar" size={10} color="#714B67" />
@@ -464,6 +488,13 @@ const styles = StyleSheet.create({
         fontWeight: '700',
         color: '#9CA3AF',
         marginLeft: 6,
+    },
+    responsible: {
+        fontSize: 10,
+        color: '#714B67',
+        marginLeft: 26,
+        marginTop: -2,
+        fontWeight: '600',
     },
     dateBadge: {
         flexDirection: 'row',

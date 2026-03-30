@@ -1,10 +1,14 @@
 import { callOdoo } from '../api/odooClient';
+import { useAuthStore } from '../store/authStore';
+import { useConfigStore } from '../store/configStore';
+import { getSiatDomain } from '../utils/permissionUtils';
 import * as db from './dbService';
 import * as FileSystem from 'expo-file-system/legacy';
 
 export const submitPickingDelivery = async (
     pickingId: number,
-    deliveries: Array<{ moveId: number; quantity: number }>
+    deliveries: Array<{ moveId: number; quantity: number }>,
+    silent: boolean = false
 ) => {
     for (const delivery of deliveries) {
         await callOdoo('stock.move', 'write', {
@@ -12,7 +16,7 @@ export const submitPickingDelivery = async (
             vals: {
                 quantity: delivery.quantity
             }
-        });
+        }, silent);
     }
 
     await callOdoo('stock.picking', 'button_validate', {
@@ -20,67 +24,120 @@ export const submitPickingDelivery = async (
         context: {
             skip_backorder: true
         }
-    });
+    }, silent);
 };
 
 export const runSync = async (onProgress?: (msg: string) => void) => {
+    const { user } = useAuthStore.getState();
+    const storePerms = user?.permissions;
+    const { getActiveProfile } = useConfigStore.getState();
+    const activeProfile = getActiveProfile();
+
+    // El UID viene del login, pero la API Key puede venir del perfil técnico
+    const uid = user?.uid;
+    const apiKey = user?.apiKey || activeProfile?.apiKey;
+
+    if (!uid) {
+        throw new Error("No hay un usuario identificado. Por favor, inicie sesión.");
+    }
+
+    if (!apiKey) {
+        throw new Error("No hay una API Key configurada en el perfil de conexión.");
+    }
+
+    // Permisos por defecto si no se recuperaron del servidor durante el login
+    const permissions = storePerms || {
+        is_admin: false,
+        view_sales: true,
+        view_invoices: true,
+        view_contacts: true,
+        view_pickings: true,
+        view_receivables: true,
+        role_codes: ['portal']
+    };
+
     try {
-        onProgress?.('Iniciando sincronización...');
         await db.initDB();
+        const companyId = user?.company_id || 1;
+        const companyIds = user?.company_ids || [companyId];
+        
+        const baseUser = { 
+            uid: Number(uid), 
+            company_id: companyId, 
+            company_ids: companyIds 
+        };
+
+        console.log('--- DIAGNÓSTICO DE SINCRONIZACIÓN ---');
+        console.log('User UID:', baseUser.uid);
+        console.log('Company IDs:', JSON.stringify(baseUser.company_ids));
+        console.log('Roles:', JSON.stringify(permissions.role_codes));
+        console.log('Is Admin:', permissions.is_admin);
+        console.log('-------------------------------------');
 
         // 1. Sync Partners
         onProgress?.('Sincronizando clientes...');
+        const partnerDomain = getSiatDomain('res.partner', baseUser, permissions);
         const partners = await callOdoo('res.partner', 'search_read', {
+            domain: partnerDomain,
             fields: [
                 "display_name", "email", "phone", "lang", "vat",
                 "street", "street2", "city", "zip",
                 "credit", "debit", "credit_limit", "total_due", "total_overdue",
-                "comment", "image_128",
+                "comment", "image_128", "company_id", "user_id",
                 "x_studio_complemento", "x_studio_giro", 
                 "x_studio_pago_a_proveedor", "x_studio_pago_de_cliente", 
                 "x_studio_razon_social", "x_studio_tipo_de_documento"
             ],
             limit: 500
         });
+        console.log(`[SYNC] Clientes descargados: ${partners?.length || 0}`);
         await db.clearTable('partners');
-        await db.savePartners(partners);
+        if (partners && partners.length > 0) {
+            await db.savePartners(partners);
+            console.log(`[SYNC] Éxito: ${partners.length} clientes guardados localmente.`);
+        }
 
         // 2. Sync Sale Orders
         onProgress?.('Sincronizando ventas...');
+        const saleDomain = getSiatDomain('sale.order', baseUser, permissions);
         const orders = await callOdoo('sale.order', 'search_read', {
-            fields: ["name", "display_name", "partner_id", "date_order", "state", "amount_total", "order_line", "invoice_ids"],
+            domain: saleDomain,
+            fields: ["name", "display_name", "partner_id", "date_order", "state", "amount_total", "order_line", "invoice_ids", "company_id", "user_id"],
             limit: 50
         });
-
-        const allOrderLineIds = orders.flatMap((o: any) => o.order_line);
-        if (allOrderLineIds.length > 0) {
-            const lines = await callOdoo('sale.order.line', 'search_read', {
-                domain: [['id', 'in', allOrderLineIds]],
-                fields: ["product_id", "product_uom_qty", "price_unit", "price_subtotal"]
-            });
-            orders.forEach((o: any) => {
-                o.lines_data = lines.filter((l: any) => o.order_line.includes(l.id));
-            });
-        }
+        console.log(`[SYNC] Pedidos descargados: ${orders?.length || 0}`);
         await db.clearTable('sale_orders');
         await db.clearTable('sale_order_lines');
-        await db.saveSaleOrders(orders);
+        
+        if (orders && orders.length > 0) {
+            const allOrderLineIds = orders.flatMap((o: any) => o.order_line || []);
+            if (allOrderLineIds.length > 0) {
+                const lines = await callOdoo('sale.order.line', 'search_read', {
+                    domain: [['id', 'in', allOrderLineIds]],
+                    fields: ["product_id", "product_uom_qty", "price_unit", "price_subtotal"]
+                });
+                console.log(`[SYNC] Líneas de venta descargadas: ${lines?.length || 0}`);
+                orders.forEach((o: any) => {
+                    o.lines_data = lines.filter((l: any) => (o.order_line || []).includes(l.id));
+                });
+            }
+            await db.saveSaleOrders(orders);
+            console.log(`[SYNC] Éxito: ${orders.length} pedidos guardados localmente.`);
+        }
 
-        // 3. Sync Account Moves (Cobranzas)
-        onProgress?.('Sincronizando facturas...');
+        // 3. Sync Account Moves (Cuentas por Cobrar)
+        onProgress?.('Sincronizando deudas...');
+        const invoiceDomain = getSiatDomain('account.move', baseUser, permissions);
         const pendingMoves = await callOdoo('account.move', 'search_read', {
-            domain: [
-                ['move_type', '=', 'out_invoice'],
-                ['state', '=', 'posted'],
-                ['payment_state', 'in', ['not_paid', 'partial']]
-            ],
+            domain: invoiceDomain,
             fields: [
                 'name', 'partner_id', 'move_type', 'state', 'payment_state',
                 'invoice_date', 'invoice_date_due', 'amount_total',
-                'amount_residual', 'invoice_line_ids'
+                'amount_residual', 'invoice_line_ids', 'invoice_user_id', 'company_id'
             ],
-            limit: 50
+            limit: 200
         });
+        console.log(`[SYNC] Facturas por cobrar descargadas: ${pendingMoves?.length || 0}`);
 
         const saleInvoiceIds = Array.from(new Set(
             orders.flatMap((o: any) => Array.isArray(o.invoice_ids) ? o.invoice_ids : [])
@@ -93,7 +150,7 @@ export const runSync = async (onProgress?: (msg: string) => void) => {
                 fields: [
                     'name', 'partner_id', 'move_type', 'state', 'payment_state',
                     'invoice_date', 'invoice_date_due', 'amount_total',
-                    'amount_residual', 'invoice_line_ids'
+                    'amount_residual', 'invoice_line_ids', 'invoice_user_id', 'company_id'
                 ],
                 limit: saleInvoiceIds.length
             });
@@ -117,7 +174,7 @@ export const runSync = async (onProgress?: (msg: string) => void) => {
                 ],
                 fields: [
                     'move_id', 'product_id', 'quantity', 'price_unit', 'price_subtotal',
-                    'debit', 'credit', 'name', 'product_uom_id'
+                    'debit', 'credit', 'name', 'product_uom_id', 'date_maturity'
                 ],
                 limit: moveIds.length * 20
             });
@@ -138,38 +195,60 @@ export const runSync = async (onProgress?: (msg: string) => void) => {
 
         await db.clearTable('account_moves');
         await db.clearTable('account_move_lines');
-        await db.saveAccountMoves(moves);
+        if (moves.length > 0) {
+            await db.saveAccountMoves(moves);
+            console.log(`[SYNC] Éxito: ${moves.length} facturas guardadas localmente.`);
+        }
 
         // 4. Sync Stock Moves (Distribucion)
         onProgress?.('Sincronizando distribución...');
+        const basePickingDomain = getSiatDomain('stock.move', baseUser, permissions);
+        const stockMoveDomain = basePickingDomain.map(d => {
+            if (d[0] === 'picking_type_code') return ['picking_id.picking_type_code', d[1], d[2]];
+            if (d[0] === 'user_id') return ['picking_id.user_id', d[1], d[2]];
+            return d;
+        });
+        stockMoveDomain.push(['state', 'in', ['draft', 'waiting', 'confirmed', 'partially_available', 'assigned']]);
+
         const stockMoves = await callOdoo('stock.move', 'search_read', {
-            domain: [
-                ['picking_code', '=', 'outgoing'],
-                ['partner_id', '!=', false],
-                ['state', 'in', ['draft', 'waiting', 'confirmed', 'partially_available', 'assigned']]
-            ],
+            domain: stockMoveDomain,
             fields: [
                 'picking_id', 'reference', 'product_id', 'product_uom_qty', 'product_uom',
                 'state', 'origin', 'partner_id', 'date', 'date_deadline', 'move_line_ids',
-                'picking_code'
+                'company_id'
             ],
             limit: 500
         });
 
-        for (const sm of stockMoves) {
-            if (sm.move_line_ids?.length > 0) {
-                sm.lines = await callOdoo('stock.move.line', 'search_read', {
-                    domain: [['move_id', '=', sm.id]],
+        if (stockMoves.length > 0) {
+            const allMoveLineIds = stockMoves.flatMap((sm: any) => sm.move_line_ids || []);
+            if (allMoveLineIds.length > 0) {
+                const moveLines = await callOdoo('stock.move.line', 'search_read', {
+                    domain: [['id', 'in', allMoveLineIds]],
                     fields: [
-                        'product_id', 'quantity', 'product_uom_id', 
+                        'move_id', 'product_id', 'quantity', 'product_uom_id', 
                         'lot_id', 'location_id', 'location_dest_id'
                     ]
                 });
+                
+                const linesByMoveId = new Map<number, any[]>();
+                for (const l of moveLines) {
+                    const mid = Array.isArray(l.move_id) ? l.move_id[0] : l.move_id;
+                    if (!linesByMoveId.has(mid)) linesByMoveId.set(mid, []);
+                    linesByMoveId.get(mid)?.push(l);
+                }
+                
+                for (const sm of stockMoves) {
+                    sm.lines = linesByMoveId.get(sm.id) || [];
+                }
             }
         }
         await db.clearTable('stock_moves');
         await db.clearTable('stock_move_lines');
-        await db.saveStockMoves(stockMoves);
+        if (stockMoves.length > 0) {
+            console.log(`Guardando ${stockMoves.length} entregas en SQLite...`);
+            await db.saveStockMoves(stockMoves);
+        }
 
         // 5. Sync Products (for sales creation offline search)
         onProgress?.('Sincronizando productos...');
@@ -189,6 +268,49 @@ export const runSync = async (onProgress?: (msg: string) => void) => {
         });
         await db.clearTable('account_journals');
         await db.saveJournals(journals);
+
+        // 7. Sync Historical Payments
+        onProgress?.('Sincronizando cobranzas...');
+        let paymentField = 'create_uid';
+        let refField = ''; // Inicialmente vacío para detectar
+        try {
+            const fieldsRes: any = await callOdoo('account.payment', 'fields_get', {
+                attributes: ['string', 'store']
+            }, true);
+            if (fieldsRes.kral_user_id) paymentField = 'kral_user_id';
+            
+            // Detectar campo de referencia prioritariamente: ref > communication > memo
+            if (fieldsRes.ref && fieldsRes.ref.store !== false) refField = 'ref';
+            else if (fieldsRes.communication) refField = 'communication';
+            else if (fieldsRes.memo) refField = 'memo';
+            
+            console.log(`Pagos: Usuario='${paymentField}', Referencia='${refField || 'ninguna'}'`);
+        } catch (e) {
+            console.warn('Error detectando campos en account.payment:', e);
+        }
+
+        const paymentDomain = getSiatDomain('account.payment', baseUser, permissions);
+        if (!permissions.is_admin) {
+            for (let i = 0; i < paymentDomain.length; i++) {
+                if (paymentDomain[i][0] === 'kral_user_id') paymentDomain[i][0] = paymentField;
+            }
+        }
+
+        const paymentFields = ['amount', 'date', 'journal_id', 'partner_id', 'company_id', paymentField];
+        if (refField) paymentFields.push(refField);
+
+        const payments = await callOdoo('account.payment', 'search_read', {
+            domain: paymentDomain,
+            fields: paymentFields,
+            limit: 200
+        });
+
+        const mappedPayments = payments.map((p: any) => ({
+            ...p,
+            user_id: p[paymentField], // Normalizar para dbService
+            ref: refField ? (p[refField] || '') : ''
+        }));
+        await db.saveAccountPayments(mappedPayments);
 
         onProgress?.('Sincronización completada.');
     } catch (error) {
@@ -216,7 +338,7 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
                         email: p.email,
                         phone: p.phone,
                     }]
-                });
+                }, true);
                 // Extract ID from Odoo response
                 const newId = Array.isArray(response) ? (response[0].id || response[0]) : (response.id || response);
                 await db.markSynced('partners', p.id, newId);
@@ -239,7 +361,7 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
                         x_studio_pago_de_cliente: p.x_studio_pago_de_cliente,
                         x_studio_tipo_de_documento: p.x_studio_tipo_de_documento
                     }
-                });
+                }, true);
                 await db.markSynced('partners', p.id, p.id);
             }
         }
@@ -260,11 +382,11 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
 
                 const response = await callOdoo('sale.order', 'create', {
                     vals_list: [{
-                        partner_id: o.partner_id ? (o.partner_id.startsWith('[') ? JSON.parse(o.partner_id)[0] : o.partner_id) : 1,
+                        partner_id: o.partner_id ? (typeof o.partner_id === 'string' && o.partner_id.startsWith('[') ? JSON.parse(o.partner_id)[0] : o.partner_id) : 1,
                         date_order: o.date_order,
                         order_line: orderLinesOdoo
                     }]
-                });
+                }, true);
                 // Extract ID from Odoo response
                 const newOrderId = Array.isArray(response) ? (response[0].id || response[0]) : (response.id || response);
                 
@@ -275,7 +397,7 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
                     const createdOrder: any = await callOdoo('sale.order', 'search_read', {
                         domain: [['id', '=', newOrderId]],
                         fields: ['order_line']
-                    });
+                    }, true);
                     if (createdOrder && createdOrder.length > 0 && createdOrder[0].order_line.length === lines.length) {
                         const odooLineIds = createdOrder[0].order_line;
                         const dbInst = await db.getDb();
@@ -315,18 +437,18 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
                         const orderOdoo: any = await callOdoo('sale.order', 'search_read', {
                             domain: [['id', '=', originOrderIdOdoo]],
                             fields: ['state', 'partner_id']
-                        });
+                        }, true);
                         
                         if (orderOdoo.length > 0 && ['draft', 'sent'].includes(orderOdoo[0].state)) {
                             onProgress?.(`Confirmando pedido Odoo: ${orderName}`);
-                            await callOdoo('sale.order', 'action_confirm', { ids: [originOrderIdOdoo] });
+                            await callOdoo('sale.order', 'action_confirm', { ids: [originOrderIdOdoo] }, true);
                         }
 
                         // 2. Fetch origin order lines to correctly link the invoice lines
                         const soLines: any = await callOdoo('sale.order.line', 'search_read', {
                             domain: [['order_id', '=', originOrderIdOdoo]],
                             fields: ['id', 'product_id', 'name', 'product_uom_qty', 'price_unit']
-                        });
+                        }, true);
 
                         // 3. Create the invoice manually with line linking
                         const dbInst = await db.getDb();
@@ -356,12 +478,12 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
                             invoice_origin: orderName,
                         };
 
-                        const response = await callOdoo('account.move', 'create', { vals_list: [invoiceVals] });
+                        const response = await callOdoo('account.move', 'create', { vals_list: [invoiceVals] }, true);
                         const newInvId = Array.isArray(response) ? (response[0].id || response[0]) : (response.id || response);
 
                         if (newInvId) {
                             onProgress?.(`Publicando factura: ${newInvId}`);
-                            await callOdoo('account.move', 'action_post', { ids: [newInvId] });
+                            await callOdoo('account.move', 'action_post', { ids: [newInvId] }, true);
                             await db.markSynced('account_moves', inv.id, newInvId);
                             console.log(`Pedido ${orderName} facturado manual-link con éxito.`);
                         }
@@ -397,7 +519,7 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
 
                 const response = await callOdoo('account.move', 'create', {
                     vals_list: [invoiceVals]
-                });
+                }, true);
                 
                 console.log('Respuesta de Odoo (Factura):', JSON.stringify(response, null, 2));
                 
@@ -409,7 +531,7 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
                     try {
                         await callOdoo('account.move', 'action_post', {
                             ids: [newInvId]
-                        });
+                        }, true);
                         console.log(`Factura ${newInvId} publicada con éxito.`);
                         
                         // Step 3c. Explicitly link to Sale Order if origin ID is known
@@ -420,7 +542,7 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
                                 vals: {
                                     invoice_ids: [[4, newInvId]] // 4: Link existing record
                                 }
-                            });
+                            }, true);
                             console.log(`Venta ${originOrderIdOdoo} vinculada a factura ${newInvId}.`);
                         }
                     } catch (postError) {
@@ -456,7 +578,8 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
                     groupMoves.map((move) => ({
                         moveId: move.id,
                         quantity: move.pending_delivery_qty
-                    }))
+                    })),
+                    true
                 );
                 for (const move of groupMoves) {
                     await db.clearPendingStockMoveDelivery(move.id);
@@ -487,7 +610,7 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
                     const wizRes: any = await callOdoo('account.payment.register', 'create', {
                         vals_list: [wizVals],
                         context: wizContext
-                    });
+                    }, true);
 
                     const wizId = Array.isArray(wizRes) ? (wizRes[0].id || wizRes[0]) : (wizRes.id || wizRes);
 
@@ -496,7 +619,7 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
                         const payRes: any = await callOdoo('account.payment.register', 'action_create_payments', {
                             ids: [wizId],
                             context: wizContext
-                        });
+                        }, true);
 
                         // Extract payment ID from action response if available, else just mark p.id as synced
                         const newPaymentId = payRes && payRes.res_id ? payRes.res_id : wizId;

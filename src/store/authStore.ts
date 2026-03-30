@@ -2,17 +2,25 @@ import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
+interface AuthUser {
+  url: string;
+  apiKey: string;
+  database: string;
+  username: string;
+  name?: string;
+  uid?: number;
+  company_id?: number;
+  company_ids?: number[];
+  company_name?: string;
+  permissions?: any;
+}
+
 interface AuthState {
   isLoggedIn: boolean;
-  user: {
-    url: string;
-    apiKey: string;
-    database: string;
-    username: string;
-  } | null;
+  user: AuthUser | null;
   
   // Actions
-  login: (userData: { url: string; apiKey: string; database: string; username: string }) => void;
+  login: (userData: AuthUser) => void;
   logout: () => void;
 }
 

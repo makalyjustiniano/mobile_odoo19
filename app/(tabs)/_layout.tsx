@@ -18,12 +18,15 @@ export default function TabLayout() {
         router.replace('/');
     };
 
+    const user = useAuthStore((state) => state.user);
+    const permissions = user?.permissions;
+
     return (
         <Tabs screenOptions={{
             tabBarActiveTintColor: '#007AFF',
             headerRight: () => (
                 <View style={{ flexDirection: 'row', alignItems: 'center', marginRight: 15 }}>
-                    <Pressable 
+                     <Pressable 
                         onPress={toggleOffline} 
                         style={{ 
                             flexDirection: 'row', 
@@ -68,6 +71,7 @@ export default function TabLayout() {
                 name="clientes"
                 options={{
                     title: 'Clientes',
+                    href: permissions?.view_contacts ? undefined : null,
                     tabBarIcon: ({ color }) => <FontAwesome name="users" size={24} color={color} />,
                 }}
             />
@@ -75,6 +79,7 @@ export default function TabLayout() {
                 name="ventas"
                 options={{
                     title: 'Ventas',
+                    href: permissions?.view_sales ? undefined : null,
                     tabBarIcon: ({ color }) => <FontAwesome name="shopping-cart" size={24} color={color} />,
                 }}
             />
@@ -82,6 +87,7 @@ export default function TabLayout() {
                 name="distribucion"
                 options={{
                     title: 'Distribución',
+                    href: permissions?.view_pickings ? undefined : null,
                     tabBarIcon: ({ color }) => <FontAwesome name="truck" size={24} color={color} />,
                 }}
             />
@@ -89,6 +95,7 @@ export default function TabLayout() {
                 name="cobranzas"
                 options={{
                     title: 'Cobranzas',
+                    href: permissions?.view_receivables ? undefined : null,
                     tabBarIcon: ({ color }) => <FontAwesome name="money" size={24} color={color} />,
                 }}
             />
@@ -97,6 +104,7 @@ export default function TabLayout() {
                 name="inventario"
                 options={{
                     title: 'Inventario',
+                    href: permissions?.view_pickings ? undefined : null, // Linked to distribution
                     tabBarIcon: ({ color }) => <FontAwesome name="archive" size={24} color={color} />,
                 }}
             />
@@ -108,8 +116,6 @@ export default function TabLayout() {
                     tabBarIcon: ({ color }) => <FontAwesome name="cog" size={24} color={color} />,
                 }}
             />
-            {/* Opcionales/Existentes si se desean mantener */}
-
         </Tabs>
     );
 }

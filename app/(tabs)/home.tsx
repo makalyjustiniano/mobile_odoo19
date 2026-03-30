@@ -5,6 +5,7 @@ import { useRouter } from 'expo-router';
 import { usePartnerStore } from '../../src/store/usePartnerStore';
 import { useProductStore } from '../../src/store/useProductStore';
 import { useConfigStore } from '../../src/store/configStore';
+import { runSync } from '../../src/services/syncService';
 
 const { width } = Dimensions.get('window');
 const COLUMN_WIDTH = (width - 40) / 2; // Subtracting padding
@@ -51,19 +52,16 @@ export default function DashboardScreen() {
     },
   ];
 
-  const fetchPartners = usePartnerStore((state) => state.fetchPartners);
-  const fetchProducts = useProductStore((state) => state.fetchProducts);
   const isOffline = useConfigStore((state) => state.isOffline);
 
   const handleSync = async () => {
     try {
-      console.log('Starting sync...');
-      await fetchPartners();
-      await fetchProducts();
-      Alert.alert('Éxito', 'Sincronización completada correctamente.');
-    } catch (error) {
+      console.log('Starting full sync to SQLite...');
+      await runSync((msg: string) => console.log(msg));
+      Alert.alert('Éxito', 'Sincronización completa (Clientes, Productos y Ventas) finalizada.');
+    } catch (error: any) {
         console.error('Sync error:', error);
-        Alert.alert('Error', 'No se pudo sincronizar con Odoo.');
+        Alert.alert('Error', 'No se pudo sincronizar con Odoo: ' + error.message);
     }
   };
 

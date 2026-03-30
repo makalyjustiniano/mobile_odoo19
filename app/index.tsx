@@ -15,7 +15,7 @@ import {
 } from 'react-native';
 import { FontAwesome } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
-import { testConnection2, testConnection } from '../src/api/odooClient';
+import { loginSiat, testConnection, fetchPortalMetadata } from '../src/api/odooClient';
 import { useAuthStore } from '../src/store/authStore';
 import { useConfigStore } from '../src/store/configStore';
 import { runSync } from '../src/services/syncService';
@@ -31,8 +31,8 @@ export default function LoginScreen() {
   const [url, setUrl] = useState(activeProfile?.url || '');
   const [apiKey, setApiKey] = useState(activeProfile?.apiKey || '');
   const [database, setDatabase] = useState(activeProfile?.database || '');
-  const [username, setUsername] = useState('admin');
-  const [password, setPassword] = useState('Odo0Kr@l');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
@@ -52,36 +52,64 @@ export default function LoginScreen() {
   const handleLogin = async () => {
     setLoading(true);
     try {
-      console.log('Iniciando autenticación para:', username);
+      console.log('Iniciando autenticación SIAT para:', username);
 
-      // Intentamos la autenticación real
-      await testConnection2(url, database, username, password);
+      // Paso 1: Autenticación SIAT (Sesión)
+      const authData = await loginSiat(url, database, username, password);
+
+      // Paso 2: Recuperar Metadatos y API Key de Sucursal usando la autoridad del Perfil
+      // fetchPortalMetadata usará la API Key definida en Ajustes para actuar como Superusuario
+      const portalInfo = await fetchPortalMetadata(authData.uid, authData.company_id);
+      
+      const activeProfile = getActiveProfile();
+      const finalApiKey = portalInfo?.siatApiKey || activeProfile?.apiKey || '';
+      const finalPermissions = portalInfo?.permissions || null;
 
       // Si tiene éxito, guardamos en Auth y actualizamos el Perfil activo
-      login({ url, apiKey, database, username });
+      login({ 
+        url, 
+        apiKey: finalApiKey, 
+        database, 
+        username,
+        name: authData.name,
+        uid: authData.uid,
+        company_id: authData.company_id,
+        company_name: authData.company_name,
+        permissions: finalPermissions
+      });
       
       if (activeProfileId) {
         setProfileField(activeProfileId, 'url', url);
         setProfileField(activeProfileId, 'database', database);
-        setProfileField(activeProfileId, 'apiKey', apiKey);
+        setProfileField(activeProfileId, 'apiKey', finalApiKey); 
       }
 
-      // Sincronización Inicial
+      // Sincronización Inicial CRÍTICA
       setSyncing(true);
+      setSyncMessage('Iniciando descarga maestra...');
       try {
-        await runSync((msg) => setSyncMessage(msg));
-      } catch (syncError) {
-        console.error('Error en sync inicial:', syncError);
-        Alert.alert('Advertencia', 'El login fue exitoso pero hubo un problema al descargar los datos para el modo offline.');
+        console.log('--- EMPEZANDO SYNC MAESTRO ---');
+        await runSync((msg) => {
+            console.log('Sync progress:', msg);
+            setSyncMessage(msg);
+        });
+        console.log('--- SYNC MAESTRO COMPLETADO ---');
+        setSyncMessage('¡Sincronización Exitosa!');
+      } catch (syncError: any) {
+        console.error('Error FATAL en sync inicial:', syncError);
+        Alert.alert(
+            'Sesión Iniciada con Advertencia', 
+            'Tus credenciales son correctas, pero no pudimos descargar todos los datos offline por problemas de conexión. Algunas funciones podrían estar vacías hasta que sincronices manualmente.'
+        );
       } finally {
         setSyncing(false);
       }
 
-      console.log('Login exitoso, redirigiendo...');
+      console.log('Autenticación y sincronización finalizadas. Redirigiendo...');
       router.replace('/(tabs)/home');
     } catch (error: any) {
       console.error('Error de Login:', error.message);
-      Alert.alert('Error de Acceso', 'Credenciales incorrectas o problema de conexión. Verifique su email y password.');
+      Alert.alert('Error de Acceso', error.message || 'Credenciales incorrectas o problema de conexión.');
     } finally {
       setLoading(false);
     }
@@ -126,23 +154,6 @@ export default function LoginScreen() {
                   autoCapitalize="none"
                   keyboardType="url"
                 />
-              </View>
-
-              {/* API Key Input */}
-              <View style={styles.inputContainer}>
-                <FontAwesome name="key" size={20} color="#9CA3AF" style={styles.icon} />
-                <TextInput
-                  style={styles.input}
-                  placeholder="Odoo API Key"
-                  placeholderTextColor="#9CA3AF"
-                  value={apiKey}
-                  onChangeText={setApiKey}
-                  autoCapitalize="none"
-                  secureTextEntry={!showApiKey}
-                />
-                <TouchableOpacity onPress={() => setShowApiKey(!showApiKey)}>
-                  <FontAwesome name={showApiKey ? "eye" : "eye-slash"} size={20} color="#9CA3AF" />
-                </TouchableOpacity>
               </View>
 
               {/* Database Input */}

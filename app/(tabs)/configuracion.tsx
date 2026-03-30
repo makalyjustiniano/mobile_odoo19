@@ -16,9 +16,13 @@ import { useConfigStore } from '../../src/store/configStore';
 import { useAuthStore } from '../../src/store/authStore';
 import { uploadOfflineChanges, backupAndPurgeDatabase } from '../../src/services/syncService';
 import { printerService, PrinterDevice } from '../../src/services/printerService';
+import { startAutoSync, stopAutoSync } from '../../src/services/autoSyncService';
 
 export default function ConfiguracionScreen() {
-  const { profiles, activeProfileId, setActiveProfile, setProfileField, toggleOffline, isOffline } = useConfigStore();
+  const { 
+    profiles, activeProfileId, setActiveProfile, setProfileField, 
+    toggleOffline, isOffline, autoSyncEnabled, syncIntervalMinutes, setSyncSettings 
+  } = useConfigStore();
   
   const handleFieldChange = (id: string, field: any, value: string) => {
     setProfileField(id, field, value);
@@ -229,6 +233,51 @@ export default function ConfiguracionScreen() {
             thumbColor={isOffline ? '#fff' : '#f4f3f4'}
           />
         </View>
+      </View>
+
+      <View style={styles.section}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+          <View>
+            <Text style={styles.sectionTitle}>Sincronización Automática</Text>
+            <Text style={[styles.info, { marginTop: 0 }]}>
+              {autoSyncEnabled ? `Cada ${syncIntervalMinutes} min` : 'Deshabilitada'}
+            </Text>
+          </View>
+          <Switch
+            value={autoSyncEnabled}
+            onValueChange={(val) => {
+                setSyncSettings(val, syncIntervalMinutes);
+                if (val) startAutoSync();
+                else stopAutoSync();
+            }}
+            trackColor={{ false: '#d1d5db', true: '#22C55E' }}
+            thumbColor={autoSyncEnabled ? '#fff' : '#f4f3f4'}
+          />
+        </View>
+        
+        {autoSyncEnabled && (
+            <View style={{ marginTop: 15, borderTopWidth: 1, borderTopColor: '#f3f4f6', paddingTop: 10 }}>
+                <Text style={styles.label}>Intervalo de reintento (minutos)</Text>
+                <View style={[styles.pickerContainer, { marginTop: 5 }]}>
+                    <Picker
+                        selectedValue={syncIntervalMinutes}
+                        onValueChange={(itemValue) => {
+                            setSyncSettings(autoSyncEnabled, itemValue);
+                            startAutoSync();
+                        }}
+                        style={styles.picker}
+                    >
+                        <Picker.Item label="1 minuto" value={1} />
+                        <Picker.Item label="3 minutos" value={3} />
+                        <Picker.Item label="5 minutos" value={5} />
+                        <Picker.Item label="10 minutos" value={10} />
+                    </Picker>
+                </View>
+                <Text style={{ fontSize: 11, color: '#9CA3AF', marginTop: 5 }}>
+                    * El sistema subirá las ventas pendientes automáticamente en este intervalo si hay señal.
+                </Text>
+            </View>
+        )}
       </View>
 
       <View style={styles.section}>

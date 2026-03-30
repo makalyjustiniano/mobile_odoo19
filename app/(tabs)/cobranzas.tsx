@@ -19,6 +19,8 @@ import { FontAwesome } from '@expo/vector-icons';
 import { callOdoo } from '../../src/api/odooClient';
 import { useConfigStore } from '../../src/store/configStore';
 import * as db from '../../src/services/dbService';
+import { getSiatDomain } from '../../src/utils/permissionUtils';
+import { useAuthStore } from '../../src/store/authStore';
 
 // Enable LayoutAnimation for Android
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
@@ -71,34 +73,49 @@ export default function CobranzasScreen() {
             await db.initDB();
             setLoading(true);
 
-            if (isOffline) {
-                console.log('Fetching invoices from SQLite...');
-                const localData = await db.getAccountMoves({ pendingOnly: true });
+            // 1. CARGA INSTANTÁNEA (Offline-First por defecto)
+            console.log('Cargando facturas desde SQLite...');
+            const localData = await db.getAccountMoves();
+            if (localData && localData.length > 0) {
                 setInvoices(localData as any);
-                return;
+                setLoading(false); // Liberamos la UI rápido
             }
 
-            console.log('Fetching invoices from Odoo...');
-            const result = await callOdoo('account.move', 'search_read', {
-                domain: [
-                    ['move_type', '=', 'out_invoice'],
-                    ['state', '=', 'posted'],
-                    ['payment_state', 'in', ['not_paid', 'partial']]
-                ],
-                fields: [
-                    'name',
-                    'partner_id',
-                    'invoice_date',
-                    'invoice_date_due',
-                    'amount_total',
-                    'amount_residual',
-                    'invoice_line_ids'
-                ],
-                limit: 50
-            });
-            setInvoices(result.map((m: any) => ({ ...m, expanded: false, lines: [], loadingLines: false })));
+            // 2. ACTUALIZACIÓN EN SEGUNDO PLANO (Si hay internet)
+            if (!isOffline) {
+                console.log('Refrescando datos desde Odoo...');
+                try {
+                    const user = useAuthStore.getState().user;
+                    const invoiceDomain = getSiatDomain('account.move', user);
+                    
+                    // Combinamos con filtros de estado específicos de esta pantalla
+                    const fullDomain = [
+                        '&',
+                        ...invoiceDomain,
+                        '&',
+                        ['state', '=', 'posted'],
+                        ['payment_state', 'in', ['not_paid', 'partial']]
+                    ];
+
+                    const result = await callOdoo('account.move', 'search_read', {
+                        domain: fullDomain,
+                        fields: ['name', 'partner_id', 'invoice_date', 'invoice_date_due', 'amount_total', 'amount_residual', 'invoice_line_ids', 'invoice_user_id', 'company_id'],
+                        limit: 100
+                    }, true);
+
+                    if (result && Array.isArray(result)) {
+                        // Guardamos lo nuevo en SQLite
+                        await db.saveAccountMoves(result);
+                        // Recargamos de SQLite para mantener consistencia
+                        const updatedLocal = await db.getAccountMoves();
+                        setInvoices(updatedLocal as any);
+                    }
+                } catch (onlineErr) {
+                    console.warn('No se pudo refrescar de Odoo, manteniendo datos locales.');
+                }
+            }
         } catch (error) {
-            console.error('Error fetching invoices for cobranzas:', error);
+            console.error('Error en carga de facturas:', error);
         } finally {
             setLoading(false);
             setRefreshing(false);

@@ -12,7 +12,9 @@ import {
     Alert,
     KeyboardAvoidingView,
     Platform,
-    ScrollView
+    ScrollView,
+    Image,
+    Linking
 } from 'react-native';
 import { FontAwesome } from '@expo/vector-icons';
 import { callOdoo } from '../../src/api/odooClient';
@@ -20,6 +22,9 @@ import { useConfigStore } from '../../src/store/configStore';
 import { usePartnerStore } from '../../src/store/usePartnerStore';
 import { useProductStore } from '../../src/store/useProductStore';
 import * as db from '../../src/services/dbService';
+import { uploadOfflineChanges } from '../../src/services/syncService';
+import { getSiatDomain } from '../../src/utils/permissionUtils';
+import { useAuthStore } from '../../src/store/authStore';
 
 interface SaleOrderLine {
     id: number;
@@ -40,6 +45,9 @@ interface SaleOrder {
     order_line: number[];
     invoice_id?: number | null;
     lines_data?: SaleOrderLine[];
+    user_name?: string;
+    is_local?: number;
+    sync_status?: string;
 }
 
 interface Partner {
@@ -63,10 +71,22 @@ interface NewLine {
 interface Invoice {
     id: number;
     name: string;
+    partner_id: [number, string];
     partner_name: string;
+    partner_mobile?: string;
+    partner_email?: string;
     invoice_date: string;
     amount_total: number;
     amount_residual: number;
+    state: string;
+    invoice_user_id?: [number, string];
+    invoice_user_name?: string;
+    access_token?: string;
+    siat_status?: string;
+    siat_url?: string;
+    siat_qr_content?: string;
+    siat_cuf?: string;
+    siat_leyenda?: string;
     lines?: any[];
 }
 
@@ -105,38 +125,35 @@ export default function VentasScreen() {
             await db.initDB();
             if (!refreshing) setLoading(true);
 
-            if (isOffline) {
-                console.log('Fetching sales from SQLite...');
-                const localOrders = await db.getSaleOrders();
-                setResult(localOrders as any);
-                return;
-            }
+            // 1. CARGA INSTANTÁNEA (Siempre de SQLite primero)
+            console.log('Cargando ventas desde SQLite...');
+            const localOrders = await db.getSaleOrders();
+            setResult(localOrders as any);
+            if (localOrders && localOrders.length > 0) setLoading(false);
 
-            console.log('Fetching sales from Odoo...');
-            const orders: SaleOrder[] = await callOdoo('sale.order', 'search_read', {
-                fields: ["name", "display_name", "partner_id", "date_order", "state", "amount_total", "order_line", "invoice_ids"],
-                limit: 20
-            });
+            // 2. ACTUALIZACIÓN EN SEGUNDO PLANO (Si online)
+            if (!isOffline) {
+                console.log('Sincronizando historial de ventas con Odoo...');
+                try {
+                    const user = useAuthStore.getState().user;
+                    const saleDomain = getSiatDomain('sale.order', user);
+                    
+                    const orders: SaleOrder[] = await callOdoo('sale.order', 'search_read', {
+                        domain: saleDomain,
+                        fields: ["name", "display_name", "partner_id", "date_order", "state", "amount_total", "order_line", "invoice_ids", "company_id", "user_id"],
+                        limit: 50
+                    }, true);
 
-            const allLineIds = orders.flatMap(order => order.order_line);
-
-            if (allLineIds.length > 0) {
-                const lines: SaleOrderLine[] = await callOdoo('sale.order.line', 'search_read', {
-                    domain: [['id', 'in', allLineIds]],
-                    fields: ["product_id", "product_uom_qty", "price_unit", "price_subtotal"]
-                });
-
-                const ordersWithLines = orders.map(order => {
-                    const o: any = order;
-                    return {
-                        ...order,
-                        invoice_id: Array.isArray(o.invoice_ids) && o.invoice_ids.length > 0 ? o.invoice_ids[0] : null,
-                        lines_data: lines.filter(line => order.order_line.includes(line.id))
-                    };
-                });
-                setResult(ordersWithLines);
-            } else {
-                setResult(orders.map(o => ({ ...o, invoice_id: (o as any).invoice_ids?.[0] || null })));
+                    if (orders && Array.isArray(orders)) {
+                        // Guardar en SQLite
+                        await db.saveSaleOrders(orders);
+                        // Recargar de SQLite para consistencia
+                        const updatedLocal = await db.getSaleOrders();
+                        setResult(updatedLocal as any);
+                    }
+                } catch (e) {
+                    console.warn('Fallo actualización online de ventas.');
+                }
             }
         } catch (error) {
             console.error("Error al cargar ventas:", error);
@@ -160,19 +177,19 @@ export default function VentasScreen() {
             return;
         }
 
-        // 1. Busqueda local (Instantanea)
-        const localResults = usePartnerStore.getState().searchPartnersLocal(query);
+        // 1. Busqueda local (Instantanea desde SQLite)
+        const localResults = await db.searchPartners(query);
         setPartners(localResults as any);
         setShowPartnerResults(true);
 
-        // 2. Busqueda online de respaldo (si no es offline)
+        // 2. Busqueda online de respaldo (si no es offline, SILENCIOSA)
         if (!isOffline) {
             try {
                 const results = await callOdoo('res.partner', 'search_read', {
                     domain: [['name', 'ilike', query]],
                     fields: ['name'],
                     limit: 10
-                });
+                }, true); // Silent = true
                 
                 const partnerArray = Array.isArray(results) ? results : (results?.result || []);
                 if (partnerArray.length > 0) {
@@ -182,7 +199,7 @@ export default function VentasScreen() {
                     })));
                 }
             } catch (error) {
-                console.log('Online partner search failed, using local results.');
+                console.log('Online partner search failed, using local SQLite results.');
             }
         }
     };
@@ -196,8 +213,8 @@ export default function VentasScreen() {
             return;
         }
 
-        // 1. Busqueda local
-        const localResults = useProductStore.getState().searchProductsLocal(query);
+        // 1. Busqueda local (SQLite)
+        const localResults = await db.searchProducts(query);
         setProducts(localResults as any);
         setShowProductResults(true);
 
@@ -207,14 +224,14 @@ export default function VentasScreen() {
                     domain: [['name', 'ilike', query], ['sale_ok', '=', true]],
                     fields: ['display_name', 'list_price'],
                     limit: 10
-                });
+                }, true); // Silent = true
                 
                 const productArray = Array.isArray(results) ? results : (results?.result || []);
                 if (productArray.length > 0) {
                     setProducts(productArray);
                 }
             } catch (error) {
-                console.log('Online product search failed, using local.');
+                console.log('Online product search failed, using local SQLite.');
             }
         }
     };
@@ -251,6 +268,13 @@ export default function VentasScreen() {
         }));
     };
 
+    const updatePrice = (productId: number, newPrice: string) => {
+        const val = parseFloat(newPrice) || 0;
+        setQuoteLines(quoteLines.map(l => 
+            l.product_id === productId ? { ...l, price: val } : l
+        ));
+    };
+
     const saveQuotation = async () => {
         if (!selectedPartner) {
             Alert.alert('Error', 'Seleccione un cliente');
@@ -264,52 +288,45 @@ export default function VentasScreen() {
         try {
             setLoading(true);
 
-            if (isOffline) {
-                const localOrder = {
-                    partner_name: selectedPartner.display_name,
-                    date_order: new Date().toISOString().replace('T', ' ').substring(0, 19),
-                    amount_total: quoteLines.reduce((acc, l) => acc + (l.price * l.quantity), 0)
-                };
-                
-                await db.createSaleOrderLocal(localOrder, quoteLines);
-                
-                setModalVisible(false);
-                Alert.alert('Modo Offline', 'Cotización guardada localmente.');
-                
-                setSelectedPartner(null);
-                setPartnerSearch('');
-                setQuoteLines([]);
-                fetchData();
-                return;
-            }
-
-            const lines = quoteLines.map(line => [0, 0, {
-                product_id: line.product_id,
-                product_uom_qty: line.quantity,
-                price_unit: line.price
-            }]);
-
-            const vals = {
-                partner_id: selectedPartner.id,
-                order_line: lines,
-                date_order: new Date().toISOString().split('T')[0] + " " + new Date().toLocaleTimeString('en-GB'),
-                state: 'draft',
+            const user = useAuthStore.getState().user;
+            const localOrder = {
+                partner_name: selectedPartner.display_name,
+                partner_id: selectedPartner.id, // Para sincronización posterior
+                date_order: new Date().toISOString().replace('T', ' ').substring(0, 19),
+                amount_total: quoteLines.reduce((acc, l) => acc + (l.price * l.quantity), 0),
+                user_id: user?.uid || null,
+                user_name: user?.name || ''
             };
-
-            await callOdoo('sale.order', 'create', {
-                vals_list: [vals]
-            });
-
+            
+            console.log('[HybridSync] Guardando borrador localmente...');
+            await db.createSaleOrderLocal(localOrder, quoteLines);
+            
+            // 2. Limpiar UI y cerrar modal para dar feedback instantáneo de que se guardó
             setModalVisible(false);
-            Alert.alert('Éxito', `Cotización creada correctamente en Odoo.`);
-
+            const partnerDisplayName = selectedPartner.display_name;
             setSelectedPartner(null);
             setPartnerSearch('');
             setQuoteLines([]);
+
+            // 3. INTENTO DE SINCRONIZACIÓN AUTOMÁTICA (Híbrido - Prioridad Online)
+            if (!isOffline) {
+                console.log('[HybridSync] Detectado modo Online. Sincronizando inmediatamente...');
+                try {
+                    // Subir cambios pendientes (incluyendo este nuevo)
+                    await uploadOfflineChanges();
+                    Alert.alert('Éxito (Online)', `Venta de ${partnerDisplayName} sincronizada correctamente con Odoo.`);
+                } catch (syncErr: any) {
+                    console.log('[HybridSync] Error al subir, queda para después:', syncErr.message);
+                    Alert.alert('Guardado Offline', `Venta de ${partnerDisplayName} guardada localmente. Se sincronizará automáticamente al mejorar la conexión.`);
+                }
+            } else {
+                Alert.alert('Modo Offline', `Venta de ${partnerDisplayName} guardada localmente en el dispositivo.`);
+            }
+            
             fetchData();
         } catch (error: any) {
-            console.error('Error creating quotation:', error);
-            Alert.alert('Error', `Odoo respondió: ${error.message}`);
+            console.error('Error in saveQuotation:', error);
+            Alert.alert('Error Fatal', `No se pudo guardar la venta localmente: ${error.message}`);
         } finally {
             setLoading(false);
         }
@@ -318,14 +335,63 @@ export default function VentasScreen() {
     const confirmExistingOrder = async (orderId: number) => {
         try {
             setLoading(true);
+            
+            // SI ESTAMOS OFFLINE: Confirmar localmente de inmediato y salir
+            if (isOffline) {
+                console.log('[DB] Modo offline activo, confirmando localmente...');
+                await db.confirmSaleOrderLocal(orderId);
+                Alert.alert('Modo Offline', 'Pedido confirmado localmente. Se sincronizará al recuperar conexión.');
+                fetchData();
+                return;
+            }
+
+            let realOdooId = orderId;
+            
+            // Si el ID es negativo, el pedido es local y Odoo no lo conoce
+            if (orderId < 0) {
+                if (isOffline) {
+                    Alert.alert('Acción requerida', 'Debes estar online para confirmar este pedido en el servidor.');
+                    return;
+                }
+                
+                console.log('[HybridSync] Sincronizando pedido local antes de confirmar...');
+                await uploadOfflineChanges();
+                
+                // Buscar el nuevo ID real en SQLite
+                const dbInst = await db.getDb();
+                const syncedOrder: any = await dbInst.getFirstAsync(
+                    'SELECT id FROM sale_orders WHERE sync_status = "synced" AND amount_total = (SELECT amount_total FROM sale_orders WHERE id = ?)', 
+                    [orderId]
+                );
+                
+                if (syncedOrder && syncedOrder.id > 0) {
+                    realOdooId = syncedOrder.id;
+                    console.log('[HybridSync] Pedido sincronizado correctamente con ID:', realOdooId);
+                } else {
+                    // Si no lo encontramos por algun motivo, refrescamos toda la lista
+                    await fetchData();
+                    Alert.alert('Sincronizado', 'El pedido se ha subido a Odoo. Por favor, selecciona el pedido sincronizado e intenta confirmar de nuevo.');
+                    return;
+                }
+            }
+
+            console.log('[RPC] Confirmando pedido en Odoo:', realOdooId);
             await callOdoo('sale.order', 'action_confirm', {
-                ids: [orderId]
+                ids: [realOdooId]
             });
             Alert.alert('Éxito', 'Venta confirmada correctamente');
             fetchData();
         } catch (error: any) {
             console.error('Error confirming order:', error);
-            Alert.alert('Error', `No se pudo confirmar: ${error.message}`);
+            // Si falla por falta de internet o error de Odoo (ej: reglas de stock), confirmamos localmente
+            try {
+                console.log('[DB] Falló confirmación online, aplicando confirmación local provisoria...');
+                await db.confirmSaleOrderLocal(orderId);
+                Alert.alert('Guardado Local', 'El pedido se ha marcado como Pedido localmente. Se validará con Odoo en la próxima sincronización.');
+                fetchData();
+            } catch (dbErr) {
+                Alert.alert('Error', `No se pudo confirmar: ${error.message}`);
+            }
         } finally {
             setLoading(false);
         }
@@ -334,58 +400,30 @@ export default function VentasScreen() {
     const handleCreateInvoice = async (orderId: number) => {
         try {
             setLoading(true);
-            if (isOffline) {
-                await db.createInvoiceLocal(orderId);
-                Alert.alert('Éxito', 'Factura generada localmente. Podrá visualizarla abajo.');
-                fetchData();
-                return;
-            }
-
-            // Online invoicing: Manual creation with linking
-            const orderOdoo = await callOdoo('sale.order', 'search_read', {
-                domain: [['id', '=', orderId]],
-                fields: ['state', 'name', 'partner_id', 'order_line']
-            });
             
-            if (orderOdoo.length > 0) {
-                const order = orderOdoo[0];
-                if (['draft', 'sent'].includes(order.state)) {
-                    await callOdoo('sale.order', 'action_confirm', { ids: [orderId] }); 
+            // 1. SIEMPRE GENERAR LOCAL PRIMERO
+            console.log('[HybridSync] Generando factura local...');
+            const user = useAuthStore.getState().user;
+            await db.createInvoiceLocal(orderId, user?.uid || null, user?.name || null);
+            
+            // 2. INTENTO DE SINCRONIZACIÓN AUTOMÁTICA
+            if (!isOffline) {
+                console.log('[HybridSync] Intentando subir facturas a Odoo...');
+                try {
+                    await uploadOfflineChanges();
+                    Alert.alert('Éxito', 'Factura generada y sincronizada correctamente.');
+                } catch (syncErr: any) {
+                    console.log('[HybridSync] Error al subir factura, queda para después:', syncErr.message);
+                    Alert.alert('Factura Guardada', 'Factura generada localmente. Se subirá a Odoo automáticamente al recuperar señal.');
                 }
-
-                // Fetch SO lines for linking
-                const soLines = await callOdoo('sale.order.line', 'search_read', {
-                    domain: [['order_id', '=', orderId]],
-                    fields: ['id', 'product_id', 'name', 'product_uom_qty', 'price_unit']
-                });
-
-                const invoiceLinesOdoo = soLines.map((sol: any) => [0, 0, {
-                    name: sol.name,
-                    quantity: sol.product_uom_qty,
-                    price_unit: sol.price_unit,
-                    sale_line_ids: [[4, sol.id]]
-                }]);
-
-                const invoiceVals = {
-                    move_type: 'out_invoice',
-                    partner_id: order.partner_id[0],
-                    invoice_date: new Date().toISOString().split('T')[0],
-                    invoice_line_ids: invoiceLinesOdoo,
-                    invoice_origin: order.name,
-                };
-
-                const invResponse = await callOdoo('account.move', 'create', { vals_list: [invoiceVals] });
-                const newInvId = Array.isArray(invResponse) ? (invResponse[0].id || invResponse[0]) : (invResponse.id || invResponse);
-
-                if (newInvId) {
-                    await callOdoo('account.move', 'action_post', { ids: [newInvId] });
-                    Alert.alert('Éxito', 'Factura generada y publicada en Odoo.');
-                }
+            } else {
+                Alert.alert('Modo Offline', 'Factura generada localmente.');
             }
+            
             fetchData();
         } catch (error: any) {
-            console.error('Error creating invoice:', error);
-            Alert.alert('Error', `No se pudo facturar: ${error.message}`);
+            console.error('Error in handleCreateInvoice:', error);
+            Alert.alert('Error', `No se pudo generar la factura: ${error.message}`);
         } finally {
             setLoading(false);
         }
@@ -406,9 +444,13 @@ export default function VentasScreen() {
                 return;
             }
 
-            const invData = await callOdoo('account.move', 'search_read', {
+            const invData: any = await callOdoo('account.move', 'search_read', {
                 domain: [['id', '=', invoiceId]],
-                fields: ['name', 'partner_id', 'invoice_date', 'amount_total', 'amount_residual', 'invoice_line_ids']
+                fields: [
+                    'name', 'partner_id', 'invoice_date', 'amount_total', 'amount_residual', 
+                    'invoice_line_ids', 'invoice_user_id', 'access_token',
+                    'siat_estado', 'siat_cuf', 'siat_qr_string', 'siat_qr_image', 'siat_leyenda'
+                ]
             });
 
             if (invData.length > 0) {
@@ -417,9 +459,27 @@ export default function VentasScreen() {
                     domain: [['move_id', '=', invoiceId], ['display_type', 'not in', ['line_section', 'line_note']]],
                     fields: ['name', 'quantity', 'price_unit', 'price_subtotal']
                 });
+
+                // Optimization: Fetch partner data from LOCAL table first 
+                const dbInst = await db.getDb();
+                const partnerLoc: any = await dbInst.getFirstAsync(
+                    'SELECT mobile, phone, email FROM partners WHERE id = ?', 
+                    [inv.partner_id[0]]
+                );
+                
+                const partner = partnerLoc || {};
+
                 setSelectedInvoice({
                     ...inv,
-                    partner_name: inv.partner_id[1],
+                    partner_name: inv.partner_id ? inv.partner_id[1] : (inv as any).partner_name,
+                    partner_mobile: partner.mobile || partner.phone || '',
+                    partner_email: partner.email || '',
+                    invoice_user_name: inv.invoice_user_id ? inv.invoice_user_id[1] : '',
+                    siat_status: inv.siat_estado,
+                    siat_url: inv.siat_qr_string,
+                    siat_qr_content: inv.siat_qr_image,
+                    siat_cuf: inv.siat_cuf,
+                    siat_leyenda: inv.siat_leyenda,
                     lines
                 });
             }
@@ -430,13 +490,53 @@ export default function VentasScreen() {
         }
     };
 
+    const handleSendSiat = async (invoiceId: number) => {
+        try {
+            setLoading(true);
+            if (isOffline) {
+                console.log('[SIAT] Modo offline, marcando factura para envío local...');
+                await db.setInvoiceSiatStatusLocal(invoiceId, 'to_send');
+                Alert.alert('SIAT Offline', 'Factura marcada para envío SIAT. Se transmitirá automáticamente al recuperar internet.');
+                
+                // Actualizar estado local en UI
+                if (selectedInvoice) {
+                    setSelectedInvoice({ ...selectedInvoice, siat_status: 'to_send' });
+                }
+                return;
+            }
+
+            console.log('[SIAT] Enviando factura a SIAT Odoo...');
+            // El método correcto según el modelo es action_send_siat
+            await callOdoo('account.move', 'action_send_siat', { ids: [invoiceId] });
+            Alert.alert('Éxito', 'Factura enviada al SIAT correctamente');
+            viewInvoiceDetail(invoiceId);
+        } catch (error: any) {
+            console.error('Error sending SIAT:', error);
+            // Si falla online, ofrecemos guardar localmente
+            try {
+                await db.setInvoiceSiatStatusLocal(invoiceId, 'to_send');
+                Alert.alert('Guardado Local', 'No se pudo contactar al SIAT (Odoo), pero se guardó la intención de envío localmente.');
+                if (selectedInvoice) setSelectedInvoice({ ...selectedInvoice, siat_status: 'to_send' });
+            } catch (e) {
+                Alert.alert('Error', `No se pudo enviar al SIAT: ${error.message}`);
+            }
+        } finally {
+            setLoading(false);
+        }
+    };
+
     const renderCard = ({ item }: { item: SaleOrder }) => (
         <View style={styles.card}>
             <View style={styles.cardHeader}>
-                <Text style={styles.orderName}>{item.name || item.display_name}</Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
+                    <Text style={styles.orderName} numberOfLines={1}>{item.name || item.display_name}</Text>
+                    {item.is_local === 1 && (
+                        <FontAwesome name="cloud-upload" size={16} color="#F59E0B" style={{ marginLeft: 8 }} />
+                    )}
+                </View>
                 <View style={[styles.statusBadge, { backgroundColor: item.state === 'sale' ? '#D1FAE5' : '#FEF3C7' }]}>
                     <Text style={[styles.statusText, { color: item.state === 'sale' ? '#065F46' : '#92400E' }]}>
-                        {item.state === 'sale' ? 'Pedido' : 'Cotización'}
+                        {item.state === 'sale' ? (item.is_local === 1 ? 'Pedido (Local)' : 'Pedido') : 'Cotización'}
                     </Text>
                 </View>
             </View>
@@ -452,6 +552,14 @@ export default function VentasScreen() {
                     <FontAwesome name="calendar" size={14} color="#6B7280" />
                     <Text style={styles.dateText}>{new Date(item.date_order).toLocaleDateString()}</Text>
                 </View>
+                {item.user_name && (
+                    <View style={styles.infoRow}>
+                        <FontAwesome name="id-badge" size={14} color="#00A09D" />
+                        <Text style={[styles.dateText, { color: '#00A09D', fontWeight: '500' }]}>
+                            Responsable: {item.user_name}
+                        </Text>
+                    </View>
+                )}
 
                 <View style={styles.divider} />
 
@@ -491,13 +599,18 @@ export default function VentasScreen() {
                         )}
 
                         {item.invoice_id && (
-                            <TouchableOpacity
-                                style={styles.viewInvoiceButton}
-                                onPress={() => viewInvoiceDetail(item.invoice_id!)}
-                            >
-                                <FontAwesome name="eye" size={14} color="#714B67" />
-                                <Text style={[styles.actionText, { color: '#714B67' }]}>VER FACTURA</Text>
-                            </TouchableOpacity>
+                            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                                <TouchableOpacity
+                                    style={styles.viewInvoiceButton}
+                                    onPress={() => viewInvoiceDetail(item.invoice_id!)}
+                                >
+                                    <FontAwesome name="eye" size={14} color="#714B67" />
+                                    <Text style={[styles.actionText, { color: '#714B67' }]}>VER FACTURA</Text>
+                                </TouchableOpacity>
+                                <View style={[styles.badge, styles.badgePosted, { marginLeft: 8 }]}>
+                                    <Text style={styles.badgeTextSmall}>FACTURADA</Text>
+                                </View>
+                            </View>
                         )}
                     </View>
                 </View>
@@ -639,7 +752,15 @@ export default function VentasScreen() {
                                     <View key={line.product_id} style={styles.quoteLine}>
                                         <View style={{ flex: 1 }}>
                                             <Text style={styles.lineName} numberOfLines={1}>{line.product_name}</Text>
-                                            <Text style={styles.linePrice}>Bs. {line.price.toFixed(2)} c/u</Text>
+                                            <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 5 }}>
+                                                <Text style={{ fontSize: 13, color: '#6B7280', marginRight: 5 }}>Bs.</Text>
+                                                <TextInput
+                                                    style={styles.priceInput}
+                                                    keyboardType="numeric"
+                                                    value={line.price.toString()}
+                                                    onChangeText={(txt) => updatePrice(line.product_id, txt)}
+                                                />
+                                            </View>
                                         </View>
                                         <View style={styles.qtyControls}>
                                             <TouchableOpacity onPress={() => updateQuantity(line.product_id, -1)}>
@@ -709,9 +830,36 @@ export default function VentasScreen() {
                         ) : selectedInvoice ? (
                             <ScrollView style={styles.modalBody}>
                                 <View style={styles.invoiceHeaderInfo}>
-                                    <Text style={styles.invNumber}>{selectedInvoice.name}</Text>
-                                    <Text style={styles.invPartner}>{selectedInvoice.partner_name}</Text>
-                                    <Text style={styles.invDate}>Fecha: {selectedInvoice.invoice_date}</Text>
+                                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                                        <View style={{ flex: 1 }}>
+                                            <Text style={styles.invNumber}>{selectedInvoice.name}</Text>
+                                            <Text style={styles.invPartner}>{selectedInvoice.partner_name}</Text>
+                                            <Text style={styles.invDate}>Fecha: {selectedInvoice.invoice_date}</Text>
+                                        </View>
+                                        <View style={[styles.badge, 
+                                            selectedInvoice.state === 'draft' ? styles.badgeDraft : 
+                                            selectedInvoice.state === 'posted' ? styles.badgePosted : styles.badgeCancel
+                                        ]}>
+                                            <Text style={styles.badgeText}>
+                                                {selectedInvoice.state === 'draft' ? 'BORRADOR' : 
+                                                 selectedInvoice.state === 'posted' ? 'PUBLICADO' : 
+                                                 selectedInvoice.state === 'cancel' ? 'CANCELADO' : selectedInvoice.state?.toUpperCase()}
+                                            </Text>
+                                        </View>
+                                    </View>
+                                    {selectedInvoice.siat_cuf && (
+                                        <Text style={[styles.invDate, { fontSize: 10, color: '#9CA3AF' }]}>
+                                            CUF: {selectedInvoice.siat_cuf}
+                                        </Text>
+                                    )}
+                                    {selectedInvoice.invoice_user_name && (
+                                        <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 5 }}>
+                                            <FontAwesome name="id-badge" size={14} color="#714B67" />
+                                            <Text style={[styles.invDate, { marginLeft: 8, color: '#714B67', fontWeight: 'bold' }]}>
+                                                Responsable: {selectedInvoice.invoice_user_name}
+                                            </Text>
+                                        </View>
+                                    )}
                                 </View>
 
                                 <View style={styles.divider} />
@@ -736,21 +884,122 @@ export default function VentasScreen() {
                                         <Text style={styles.invResidualValue}>Bs. {selectedInvoice.amount_residual.toFixed(2)}</Text>
                                     </View>
                                 </View>
+
+                                {selectedInvoice.siat_status && (
+                                    <View style={[styles.siatBadge, { 
+                                        backgroundColor: selectedInvoice.siat_status === 'validada' ? '#D1FAE5' : 
+                                                        selectedInvoice.siat_status === 'rechazada' ? '#FEE2E2' : '#FFEDD5' 
+                                    }]}>
+                                        <FontAwesome 
+                                            name={selectedInvoice.siat_status === 'validada' ? 'check-circle' : 
+                                                  selectedInvoice.siat_status === 'rechazada' ? 'times-circle' : 'clock-o'} 
+                                            size={14} 
+                                            color={selectedInvoice.siat_status === 'validada' ? '#065F46' : 
+                                                   selectedInvoice.siat_status === 'rechazada' ? '#991B1B' : '#9A3412'} 
+                                        />
+                                        <Text style={[styles.siatText, { 
+                                            color: selectedInvoice.siat_status === 'validada' ? '#065F46' : 
+                                                   selectedInvoice.siat_status === 'rechazada' ? '#991B1B' : '#9A3412' 
+                                        }]}>
+                                            SIAT: {(selectedInvoice.siat_status || '').toUpperCase()}
+                                        </Text>
+                                    </View>
+                                )}
+
+                                {(selectedInvoice.siat_url || selectedInvoice.siat_qr_content) && (
+                                    <View style={styles.qrSection}>
+                                        <Text style={styles.qrLabel}>Verificación Legal SIAT</Text>
+                                        <View style={styles.qrContainer}>
+                                            {/* Odoo Image field is base64 */}
+                                            {selectedInvoice.siat_qr_content ? (
+                                                <Image 
+                                                    source={{ uri: selectedInvoice.siat_qr_content.startsWith('http') 
+                                                        ? selectedInvoice.siat_qr_content 
+                                                        : `data:image/png;base64,${selectedInvoice.siat_qr_content}` }} 
+                                                    style={styles.qrImage}
+                                                />
+                                            ) : (
+                                                <Image 
+                                                    source={{ uri: `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(selectedInvoice.siat_url || '')}` }}
+                                                    style={styles.qrImage}
+                                                />
+                                            )}
+                                        </View>
+                                        {selectedInvoice.siat_leyenda && (
+                                            <Text style={[styles.qrLabel, { marginTop: 15, fontSize: 9, textAlign: 'center', fontWeight: 'normal' }]}>
+                                                {selectedInvoice.siat_leyenda}
+                                            </Text>
+                                        )}
+                                        {selectedInvoice.siat_url && (
+                                            <TouchableOpacity onPress={() => Alert.alert('SIAT URL', selectedInvoice.siat_url || '')}>
+                                                <Text style={styles.qrUrl} numberOfLines={1}>{selectedInvoice.siat_url}</Text>
+                                            </TouchableOpacity>
+                                        )}
+                                    </View>
+                                )}
+
                                 <View style={{ height: 40 }} />
+                                
+                                <View style={styles.modalFooter}>
+                                     <TouchableOpacity
+                                        style={[styles.printButton, { flex: 1, marginRight: 8 }]}
+                                        onPress={() => Alert.alert('Imprimir', 'Funcionalidad de impresión en desarrollo')}
+                                    >
+                                        <FontAwesome name="print" size={16} color="#fff" />
+                                        <Text style={styles.saveButtonText}>IMPRIMIR</Text>
+                                     </TouchableOpacity>
+
+                                     {(selectedInvoice.siat_status === 'validada') ? (
+                                         <View style={{ flex: 1.5, flexDirection: 'row' }}>
+                                             <TouchableOpacity
+                                               style={[styles.whatsappButton, { flex: 1, marginRight: 5 }]}
+                                               onPress={() => {
+                                                   const user = useAuthStore.getState().user;
+                                                   const baseUrl = user?.url || '';
+                                                   const portalUrl = `${baseUrl}/my/invoices/${selectedInvoice.id}${selectedInvoice.access_token ? `?access_token=${selectedInvoice.access_token}` : ''}`;
+                                                   const message = `Hola, te envío tu factura ${selectedInvoice.name}. Puedes verla aquí: ${portalUrl}`;
+                                                   
+                                                   // Clean phone number (remove non-numeric)
+                                                   const cleanPhone = (selectedInvoice.partner_mobile || '').replace(/\D/g, '');
+                                                   const waUrl = `whatsapp://send?phone=${cleanPhone}&text=${encodeURIComponent(message)}`;
+                                                   Linking.openURL(waUrl).catch(() => Alert.alert('Error', 'No se pudo abrir WhatsApp'));
+                                               }}
+                                           >
+                                               <FontAwesome name="whatsapp" size={18} color="#fff" />
+                                               <Text style={styles.saveButtonText}> WHATSAPP</Text>
+                                             </TouchableOpacity>
+
+                                             <TouchableOpacity
+                                               style={[styles.emailButton, { flex: 1 }]}
+                                               onPress={() => {
+                                                   const user = useAuthStore.getState().user;
+                                                   const baseUrl = user?.url || '';
+                                                   const portalUrl = `${baseUrl}/my/invoices/${selectedInvoice.id}${selectedInvoice.access_token ? `?access_token=${selectedInvoice.access_token}` : ''}`;
+                                                   const message = `Hola, te envío tu factura ${selectedInvoice.name}. Puedes verla aquí: ${portalUrl}`;
+                                                   const mailUrl = `mailto:${selectedInvoice.partner_email || ''}?subject=Factura ${selectedInvoice.name}&body=${encodeURIComponent(message)}`;
+                                                   Linking.openURL(mailUrl).catch(() => Alert.alert('Error', 'No hay aplicación de correo configurada.'));
+                                               }}
+                                           >
+                                               <FontAwesome name="envelope" size={16} color="#fff" />
+                                               <Text style={styles.saveButtonText}> CORREO</Text>
+                                             </TouchableOpacity>
+                                         </View>
+                                     ) : (
+                                         <TouchableOpacity
+                                           style={[styles.siatButton, { flex: 1.5 }]}
+                                           onPress={() => handleSendSiat(selectedInvoice.id)}
+                                       >
+                                           <FontAwesome name="shield" size={16} color="#fff" />
+                                           <Text style={styles.saveButtonText}> ENVIAR SIAT</Text>
+                                         </TouchableOpacity>
+                                     )}
+                                </View>
                             </ScrollView>
                         ) : (
-                            <Text style={{ padding: 20 }}>No se pudo cargar la información.</Text>
+                            <View style={{ padding: 20 }}>
+                                <Text>No se pudo cargar la información.</Text>
+                            </View>
                         )}
-                        
-                        <View style={styles.modalFooter}>
-                             <TouchableOpacity
-                                style={styles.printButton}
-                                onPress={() => Alert.alert('Imprimir', 'Funcionalidad de impresión en desarrollo')}
-                            >
-                                <FontAwesome name="print" size={16} color="#fff" />
-                                <Text style={styles.saveButtonText}>IMPRIMIR FACTURA</Text>
-                             </TouchableOpacity>
-                        </View>
                     </View>
                 </View>
             </Modal>
@@ -1180,5 +1429,119 @@ const styles = StyleSheet.create({
         fontSize: 14,
         fontWeight: 'bold',
         color: '#EF4444',
-    }
+    },
+    priceInput: {
+        borderWidth: 1,
+        borderColor: '#E5E7EB',
+        borderRadius: 6,
+        paddingHorizontal: 8,
+        paddingVertical: 4,
+        fontSize: 14,
+        color: '#00A09D',
+        fontWeight: 'bold',
+        backgroundColor: '#F3F4F6',
+        width: 110,
+    },
+    siatBadge: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        padding: 10,
+        borderRadius: 8,
+        marginTop: 15,
+        justifyContent: 'center',
+    },
+    siatText: {
+        fontSize: 13,
+        fontWeight: 'bold',
+        marginLeft: 8,
+    },
+    siatButton: {
+        backgroundColor: '#2563EB', // Azul SIAT
+        paddingVertical: 15,
+        borderRadius: 10,
+        alignItems: 'center',
+        flexDirection: 'row',
+        justifyContent: 'center',
+    },
+    qrSection: {
+        marginTop: 20,
+        padding: 15,
+        backgroundColor: '#F3F4F6',
+        borderRadius: 12,
+        alignItems: 'center',
+        borderWidth: 1,
+        borderColor: '#E5E7EB',
+        borderStyle: 'dashed',
+    },
+    qrLabel: {
+        fontSize: 12,
+        fontWeight: 'bold',
+        color: '#6B7280',
+        marginBottom: 10,
+        textTransform: 'uppercase',
+    },
+    qrContainer: {
+        backgroundColor: '#fff',
+        padding: 10,
+        borderRadius: 8,
+        elevation: 2,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 1 },
+        shadowOpacity: 0.1,
+        shadowRadius: 2,
+    },
+    qrImage: {
+        width: 150,
+        height: 150,
+    },
+    qrUrl: {
+        marginTop: 10,
+        fontSize: 11,
+        color: '#2563EB',
+        textDecorationLine: 'underline',
+        textAlign: 'center',
+        width: 200,
+    },
+    badge: {
+        paddingHorizontal: 10,
+        paddingVertical: 4,
+        borderRadius: 12,
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    badgeText: {
+        color: '#fff',
+        fontSize: 10,
+        fontWeight: 'bold',
+    },
+    badgeTextSmall: {
+        color: '#fff',
+        fontSize: 8,
+        fontWeight: 'bold',
+    },
+    badgeDraft: {
+        backgroundColor: '#9CA3AF', // Gray
+    },
+    badgePosted: {
+        backgroundColor: '#10B981', // Emerald
+    },
+    badgeCancel: {
+        backgroundColor: '#EF4444', // Red
+    },
+    whatsappButton: {
+        backgroundColor: '#25D366', // WhatsApp Green
+        height: 50,
+        borderRadius: 8,
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
+    emailButton: {
+        backgroundColor: '#3B82F6', // Odoo Blueish
+        height: 50,
+        borderRadius: 8,
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+    },
 });

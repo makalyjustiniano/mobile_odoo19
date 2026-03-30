@@ -11,6 +11,9 @@ import {
 } from 'react-native';
 import { FontAwesome } from '@expo/vector-icons';
 import { callOdoo } from '../../src/api/odooClient';
+import * as db from '../../src/services/dbService';
+import { useConfigStore } from '../../src/store/configStore';
+import { useAuthStore } from '../../src/store/authStore';
 
 interface Product {
     id: number;
@@ -28,15 +31,41 @@ export default function InventarioScreen() {
     const [refreshing, setRefreshing] = useState(false);
     const [searchQuery, setSearchQuery] = useState('');
 
+    const isOffline = useConfigStore((state) => state.isOffline);
+    const user = useAuthStore.getState().user;
+
     const fetchProducts = async () => {
         try {
             if (!refreshing) setLoading(true);
-            const data: Product[] = await callOdoo('product.product', 'search_read', {
-                domain: [['sale_ok', '=', true]],
-                fields: ["display_name", "list_price", "qty_available", "default_code", "uom_id"]
-            });
-            setProducts(data);
-            applyFilter(searchQuery, data);
+            
+            // 1. CARGA OFFLINE
+            const localData = await db.getProducts();
+            if (localData && localData.length > 0) {
+                setProducts(localData as any);
+                setFilteredProducts(localData as any);
+                setLoading(false);
+            }
+
+            // 2. ACTUALIZACIÓN ONLINE (Si hay internet)
+            if (!isOffline) {
+                const companyIds = user?.company_ids || (user?.company_id ? [user.company_id] : []);
+                
+                const data: Product[] = await callOdoo('product.product', 'search_read', {
+                    domain: [
+                        '&',
+                        ['sale_ok', '=', true],
+                        ['company_id', 'in', companyIds]
+                    ],
+                    fields: ["display_name", "list_price", "qty_available", "default_code", "uom_id"]
+                }, true);
+                
+                if (data && data.length > 0) {
+                    await db.saveProducts(data);
+                    const freshData = await db.getProducts();
+                    setProducts(freshData as any);
+                    applyFilter(searchQuery, freshData as any);
+                }
+            }
         } catch (error) {
             console.error("Error al cargar inventario:", error);
         } finally {
@@ -47,7 +76,7 @@ export default function InventarioScreen() {
 
     useEffect(() => {
         fetchProducts();
-    }, []);
+    }, [isOffline]);
 
     const onRefresh = () => {
         setRefreshing(true);

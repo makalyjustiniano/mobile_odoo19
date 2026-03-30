@@ -15,6 +15,8 @@ import { callOdoo } from '../../src/api/odooClient';
 import { useEffect, useState } from 'react';
 import { useConfigStore } from '../../src/store/configStore';
 import * as db from '../../src/services/dbService';
+import { getSiatDomain } from '../../src/utils/permissionUtils';
+import { useAuthStore } from '../../src/store/authStore';
 
 interface Partner {
   id: number;
@@ -76,27 +78,45 @@ export default function Index() {
   const fetchPartners = async () => {
     try {
       setLoading(true);
-      if (isOffline) {
-        console.log('Fetching partners from SQLite...');
-        const localData = await db.getPartners();
-        setResult(localData as any);
-        return;
-      }
+      
+      // 1. CARGA INSTANTÁNEA (Siempre de SQLite primero)
+      console.log('Cargando clientes de SQLite...');
+      const localData = await db.getPartners();
+      setResult(localData as any);
+      if (localData.length > 0) setLoading(false);
 
-      console.log('Fetching partners from Odoo...');
-      const odooData = await callOdoo('res.partner', 'search_read', {
-        fields: [
-          "display_name", "email", "phone", "lang", "vat",
-          "street", "street2", "city", "zip",
-          "credit", "debit", "credit_limit", "total_due", "total_overdue",
-          "comment", "image_128", 
-          "x_studio_razon_social", "x_studio_complemento", "x_studio_giro",
-          "x_studio_pago_a_proveedor", "x_studio_pago_de_cliente", "x_studio_tipo_de_documento"
-        ]
-      });
-      setResult(odooData as any);
-    } catch (error) {
-      console.log(error);
+      // 2. ACTUALIZACIÓN EN SEGUNDO PLANO (Si online)
+      if (!isOffline) {
+        console.log('Sincronizando clientes con Odoo...');
+        try {
+          const user = useAuthStore.getState().user;
+          const partnerDomain = getSiatDomain('res.partner', user);
+          
+          const odooData = await callOdoo('res.partner', 'search_read', {
+            domain: partnerDomain,
+            fields: [
+              "display_name", "email", "phone", "lang", "vat",
+              "street", "street2", "city", "zip",
+              "credit", "debit", "credit_limit", "total_due", "total_overdue",
+              "comment", "image_128", 
+              "x_studio_razon_social", "x_studio_complemento", "x_studio_giro",
+              "x_studio_pago_a_proveedor", "x_studio_pago_de_cliente", "x_studio_tipo_de_documento",
+              "user_id", "company_id"
+            ],
+            limit: 200
+          }, true);
+          
+          if (odooData && Array.isArray(odooData)) {
+              await db.savePartners(odooData);
+              const freshLocal = await db.getPartners();
+              setResult(freshLocal as any);
+          }
+        } catch (e) {
+          console.warn('Fallo actualización online de clientes.');
+        }
+      }
+    } catch (error: any) {
+      console.error('Error fetchPartners:', error.message);
     } finally {
       setLoading(false);
     }
