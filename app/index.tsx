@@ -56,12 +56,18 @@ export default function LoginScreen() {
 
       // Paso 1: Autenticación SIAT (Sesión)
       const authData = await loginSiat(url, database, username, password);
+      console.log('AuthData Success:', JSON.stringify(authData, null, 2));
 
       // Paso 2: Recuperar Metadatos y API Key de Sucursal usando la autoridad del Perfil
-      // fetchPortalMetadata usará la API Key definida en Ajustes para actuar como Superusuario
-      const portalInfo = await fetchPortalMetadata(authData.uid, authData.company_id);
-      
       const activeProfile = getActiveProfile();
+      const portalInfo = await fetchPortalMetadata(authData.uid, authData.company_id, {
+        url,
+        database,
+        apiKey: (authData as any).apiKey || activeProfile?.apiKey || '',
+        sessionId: (authData as any).sessionId || ''
+      });
+      console.log('PortalInfo Result:', JSON.stringify(portalInfo, null, 2));
+      
       const finalApiKey = portalInfo?.siatApiKey || activeProfile?.apiKey || '';
       const finalPermissions = portalInfo?.permissions || null;
 

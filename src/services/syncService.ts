@@ -506,6 +506,7 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
                         const invoiceVals = {
                             move_type: 'out_invoice',
                             partner_id: orderOdoo.length > 0 ? orderOdoo[0].partner_id[0] : (inv.partner_id ? (typeof inv.partner_id === 'string' && inv.partner_id.startsWith('[') ? JSON.parse(inv.partner_id)[0] : inv.partner_id) : 1),
+                            invoice_user_id: inv.invoice_user_id, // Atribución al usuario mobile
                             invoice_date: inv.invoice_date,
                             invoice_line_ids: invoiceLinesOdoo,
                             invoice_origin: orderName,
@@ -543,6 +544,7 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
                 const invoiceVals = {
                     move_type: 'out_invoice',
                     partner_id: inv.partner_id ? (typeof inv.partner_id === 'string' && inv.partner_id.startsWith('[') ? JSON.parse(inv.partner_id)[0] : inv.partner_id) : 1,
+                    invoice_user_id: inv.invoice_user_id, // Atribución al usuario mobile
                     invoice_date: inv.invoice_date,
                     invoice_line_ids: invoiceLinesOdoo,
                     invoice_origin: orderName, // Formal link via string origin

@@ -115,6 +115,27 @@ export default function VentasScreen() {
 
     const [quoteLines, setQuoteLines] = useState<NewLine[]>([]);
     const [shouldConfirm, setShouldConfirm] = useState(false);
+    
+    // Main Research Search
+    const [mainSearchQuery, setMainSearchQuery] = useState('');
+    const [filteredResult, setFilteredResult] = useState<SaleOrder[]>([]);
+
+    const handleMainSearch = (text: string) => {
+        setMainSearchQuery(text);
+        if (!text.trim()) {
+            setFilteredResult(result);
+            return;
+        }
+        const filtered = result.filter(order => 
+            (order.display_name && order.display_name.toLowerCase().includes(text.toLowerCase())) ||
+            (order.partner_id && order.partner_id[1].toLowerCase().includes(text.toLowerCase()))
+        );
+        setFilteredResult(filtered);
+    };
+
+    useEffect(() => {
+        setFilteredResult(result);
+    }, [result]);
 
     useEffect(() => {
         fetchData();
@@ -187,15 +208,26 @@ export default function VentasScreen() {
             try {
                 const results = await callOdoo('res.partner', 'search_read', {
                     domain: [['name', 'ilike', query]],
-                    fields: ['name'],
+                    fields: [
+                        "display_name", "email", "phone", "lang", "vat",
+                        "street", "street2", "city", "zip",
+                        "credit", "debit", "credit_limit", "total_due", "total_overdue",
+                        "comment", "image_128", 
+                        "x_studio_razon_social", "x_studio_complemento", "x_studio_giro",
+                        "x_studio_pago_a_proveedor", "x_studio_pago_de_cliente", "x_studio_tipo_de_documento",
+                        "user_id", "company_id", "partner_latitude", "partner_longitude"
+                    ],
                     limit: 10
                 }, true); // Silent = true
                 
                 const partnerArray = Array.isArray(results) ? results : (results?.result || []);
                 if (partnerArray.length > 0) {
+                    // ACTUALIZAR SQLITE CON DATOS FRESCOS
+                    await db.savePartners(partnerArray);
+                    
                     setPartners(partnerArray.map((p: any) => ({
                         id: p.id,
-                        display_name: p.name || p.display_name
+                        display_name: p.display_name || p.name
                     })));
                 }
             } catch (error) {
@@ -287,46 +319,90 @@ export default function VentasScreen() {
 
         try {
             setLoading(true);
-
             const user = useAuthStore.getState().user;
-            const localOrder = {
-                partner_name: selectedPartner.display_name,
-                partner_id: selectedPartner.id, // Para sincronización posterior
+            const partnerDisplayName = selectedPartner.display_name;
+            const amountTotal = quoteLines.reduce((acc, l) => acc + (l.price * l.quantity), 0);
+            
+            const commonVals = {
+                partner_id: selectedPartner.id,
                 date_order: new Date().toISOString().replace('T', ' ').substring(0, 19),
-                amount_total: quoteLines.reduce((acc, l) => acc + (l.price * l.quantity), 0),
+                amount_total: amountTotal,
                 user_id: user?.uid || null,
                 user_name: user?.name || ''
             };
-            
-            console.log('[HybridSync] Guardando borrador localmente...');
-            await db.createSaleOrderLocal(localOrder, quoteLines);
-            
-            // 2. Limpiar UI y cerrar modal para dar feedback instantáneo de que se guardó
-            setModalVisible(false);
-            const partnerDisplayName = selectedPartner.display_name;
-            setSelectedPartner(null);
-            setPartnerSearch('');
-            setQuoteLines([]);
 
-            // 3. INTENTO DE SINCRONIZACIÓN AUTOMÁTICA (Híbrido - Prioridad Online)
+            // 1. INTENTO DE OPERACIÓN EN TIEMPO REAL (Si online)
             if (!isOffline) {
-                console.log('[HybridSync] Detectado modo Online. Sincronizando inmediatamente...');
+                console.log('[RealTime] Detectado modo Online. Intentando crear en Odoo...');
                 try {
-                    // Subir cambios pendientes (incluyendo este nuevo)
-                    await uploadOfflineChanges();
-                    Alert.alert('Éxito (Online)', `Venta de ${partnerDisplayName} sincronizada correctamente con Odoo.`);
-                } catch (syncErr: any) {
-                    console.log('[HybridSync] Error al subir, queda para después:', syncErr.message);
-                    Alert.alert('Guardado Offline', `Venta de ${partnerDisplayName} guardada localmente. Se sincronizará automáticamente al mejorar la conexión.`);
+                    const orderLinesOdoo = quoteLines.map(line => [0, 0, {
+                        product_id: line.product_id,
+                        product_uom_qty: line.quantity,
+                        price_unit: line.price,
+                    }]);
+
+                    const createRes: any = await callOdoo('sale.order', 'create', {
+                        vals_list: [{
+                            partner_id: commonVals.partner_id,
+                            user_id: commonVals.user_id, // Responsable mobile
+                            order_line: orderLinesOdoo,
+                            // El servidor asignará name y date_order si no los pasamos, 
+                            // pero los incluimos para consistencia local
+                        }]
+                    });
+
+                    const newOdooId = Array.isArray(createRes) ? (createRes[0].id || createRes[0]) : (createRes.id || createRes);
+                    
+                    if (newOdooId) {
+                        // Guardar en SQLite ya marcado como sincronizado
+                        await db.createSaleOrderLocal({
+                            ...commonVals,
+                            id: newOdooId,
+                            partner_name: partnerDisplayName,
+                            sync_status: 'synced'
+                        }, quoteLines);
+
+                        // Opcional: Confirmar automáticamente si el botón lo indica
+                        if (shouldConfirm) {
+                            console.log('[RealTime] Confirmando pedido automáticamente...');
+                            await callOdoo('sale.order', 'action_confirm', { ids: [newOdooId] });
+                        }
+
+                        Alert.alert('Éxito (RealTime)', `Venta de ${partnerDisplayName} generada en Odoo correctamente.`);
+                        setModalVisible(false);
+                        setSelectedPartner(null);
+                        setQuoteLines([]);
+                        fetchData();
+                        return; // Salto exitoso
+                    }
+                } catch (onlineErr: any) {
+                    console.warn('[RealTime] Falló creación directa, reintentando via cola offline:', onlineErr.message);
                 }
-            } else {
-                Alert.alert('Modo Offline', `Venta de ${partnerDisplayName} guardada localmente en el dispositivo.`);
             }
+
+            // 2. FALLBACK: GUARDADO LOCAL (Offline o fallo de red)
+            console.log('[HybridSync] Guardando localmente para posterior sincronización...');
+            await db.createSaleOrderLocal({
+                ...commonVals,
+                partner_name: partnerDisplayName,
+                sync_status: 'new'
+            }, quoteLines);
             
+            setModalVisible(false);
+            setSelectedPartner(null);
+            setQuoteLines([]);
+            
+            if (!isOffline) {
+                // Intento de subida en background
+                uploadOfflineChanges().catch(e => console.log('Background upload delayed:', e.message));
+                Alert.alert('Información', 'Venta guardada localmente. Se subirá a Odoo en unos segundos.');
+            } else {
+                Alert.alert('Modo Offline', `Venta de ${partnerDisplayName} guardada localmente.`);
+            }
             fetchData();
         } catch (error: any) {
             console.error('Error in saveQuotation:', error);
-            Alert.alert('Error Fatal', `No se pudo guardar la venta localmente: ${error.message}`);
+            Alert.alert('Error', `No se pudo procesar la venta: ${error.message}`);
         } finally {
             setLoading(false);
         }
@@ -400,26 +476,79 @@ export default function VentasScreen() {
     const handleCreateInvoice = async (orderId: number) => {
         try {
             setLoading(true);
-            
-            // 1. SIEMPRE GENERAR LOCAL PRIMERO
-            console.log('[HybridSync] Generando factura local...');
             const user = useAuthStore.getState().user;
-            await db.createInvoiceLocal(orderId, user?.uid || null, user?.name || null);
-            
-            // 2. INTENTO DE SINCRONIZACIÓN AUTOMÁTICA
-            if (!isOffline) {
-                console.log('[HybridSync] Intentando subir facturas a Odoo...');
+            const uid = user?.uid || null;
+            const userName = user?.name || '';
+
+            // 1. INTENTO DE OPERACIÓN EN TIEMPO REAL (Si online)
+            if (!isOffline && orderId > 0) {
+                console.log('[RealTime] Detectado modo Online. Intentando facturar en Odoo...');
                 try {
-                    await uploadOfflineChanges();
-                    Alert.alert('Éxito', 'Factura generada y sincronizada correctamente.');
-                } catch (syncErr: any) {
-                    console.log('[HybridSync] Error al subir factura, queda para después:', syncErr.message);
-                    Alert.alert('Factura Guardada', 'Factura generada localmente. Se subirá a Odoo automáticamente al recuperar señal.');
+                    // Fetch order info from Odoo to ensure we have the correct partner and lines
+                    const orderData: any = await callOdoo('sale.order', 'search_read', {
+                        domain: [['id', '=', orderId]],
+                        fields: ['partner_id', 'order_line', 'name']
+                    });
+
+                    if (orderData && orderData.length > 0) {
+                        const order = orderData[0];
+                        
+                        // Fetch order lines to build invoice lines
+                        const linesData: any = await callOdoo('sale.order.line', 'search_read', {
+                            domain: [['order_id', '=', orderId]],
+                            fields: ['product_id', 'product_uom_qty', 'price_unit', 'name']
+                        });
+
+                        const invoiceLines = linesData.map((l: any) => [0, 0, {
+                            product_id: l.product_id[0],
+                            quantity: l.product_uom_qty,
+                            price_unit: l.price_unit,
+                            name: l.name,
+                            sale_line_ids: [[4, l.id]] // Link to SO line
+                        }]);
+
+                        const invoiceVals = {
+                            move_type: 'out_invoice',
+                            partner_id: order.partner_id[0],
+                            invoice_user_id: uid, // Responsable mobile
+                            invoice_date: new Date().toISOString().split('T')[0],
+                            invoice_line_ids: invoiceLines,
+                            invoice_origin: order.name,
+                        };
+
+                        const invRes: any = await callOdoo('account.move', 'create', {
+                            vals_list: [invoiceVals]
+                        });
+
+                        const newInvId = Array.isArray(invRes) ? (invRes[0].id || invRes[0]) : (invRes.id || invRes);
+
+                        if (newInvId) {
+                            // Publicar factura
+                            await callOdoo('account.move', 'action_post', { ids: [newInvId] });
+                            
+                            // Guardar en SQLite local marcado como sincronizado
+                            await db.createInvoiceLocal(orderId, uid, userName, newInvId, 'synced');
+                            
+                            Alert.alert('Éxito (RealTime)', 'Factura generada y publicada en Odoo correctamente.');
+                            fetchData();
+                            return;
+                        }
+                    }
+                } catch (onlineErr: any) {
+                    console.warn('[RealTime] Falló facturación directa:', onlineErr.message);
                 }
+            }
+            
+            // 2. FALLBACK: GENERAR LOCAL (Offline o fallo de red)
+            console.log('[HybridSync] Generando factura local...');
+            await db.createInvoiceLocal(orderId, uid, userName);
+            
+            if (!isOffline) {
+                uploadOfflineChanges().catch(e => console.log('Background sync delayed:', e.message));
+                Alert.alert('Éxito', 'Factura generada localmente. Sincronizando con Odoo...');
             } else {
                 Alert.alert('Modo Offline', 'Factura generada localmente.');
             }
-            
             fetchData();
         } catch (error: any) {
             console.error('Error in handleCreateInvoice:', error);
@@ -621,18 +750,29 @@ export default function VentasScreen() {
     return (
         <View style={styles.container}>
             <View style={styles.header}>
-                <Text style={styles.headerTitle}>Ventas & Cotizaciones</Text>
-                <TouchableOpacity
-                    style={styles.newButton}
-                    onPress={() => setModalVisible(true)}
-                >
-                    <FontAwesome name="plus" size={16} color="#fff" />
-                    <Text style={styles.newButtonText}>NUEVA</Text>
+                <Text style={styles.headerTitle}>Ventas / Sectores</Text>
+                <TouchableOpacity onPress={fetchData} disabled={loading}>
+                    <FontAwesome name="refresh" size={20} color="#714B67" />
                 </TouchableOpacity>
             </View>
 
+            <View style={styles.searchContainer}>
+                <FontAwesome name="search" size={16} color="#9CA3AF" style={styles.searchIcon} />
+                <TextInput
+                    style={styles.searchInput}
+                    placeholder="Buscar por cliente o pedido..."
+                    value={mainSearchQuery}
+                    onChangeText={handleMainSearch}
+                />
+                {mainSearchQuery.length > 0 && (
+                    <TouchableOpacity onPress={() => handleMainSearch('')}>
+                        <FontAwesome name="times-circle" size={18} color="#9CA3AF" />
+                    </TouchableOpacity>
+                )}
+            </View>
+
             <FlatList
-                data={result}
+                data={filteredResult}
                 keyExtractor={(item) => item.id.toString()}
                 renderItem={renderCard}
                 contentContainerStyle={styles.listContent}
@@ -1022,8 +1162,33 @@ const styles = StyleSheet.create({
         borderBottomColor: '#F3F4F6',
     },
     headerTitle: {
-        fontSize: 20,
+        fontSize: 22,
         fontWeight: 'bold',
+        color: '#714B67',
+    },
+    searchContainer: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: '#fff',
+        margin: 15,
+        marginBottom: 5,
+        paddingHorizontal: 15,
+        borderRadius: 12,
+        height: 48,
+        borderWidth: 1,
+        borderColor: '#E5E7EB',
+        elevation: 2,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 1 },
+        shadowOpacity: 0.1,
+        shadowRadius: 2,
+    },
+    searchIcon: {
+        marginRight: 10,
+    },
+    searchInput: {
+        flex: 1,
+        fontSize: 15,
         color: '#111827',
     },
     newButton: {

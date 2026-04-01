@@ -374,22 +374,24 @@ export const createSaleOrderLocal = async (order: any, lines: any[]) => {
     console.log('[DEBUG] createSaleOrderLocal called with:', JSON.stringify(order), lines.length, 'lines');
     const db = await getDb();
     
-    // Generate a negative ID for local records to avoid conflict with Odoo IDs
-    const localOrderId = -Math.floor(Date.now() / 1000);
+    // Si ya viene con ID real (RealTime), lo usamos. Si no, generamos uno local negativo.
+    const isRealTime = order.id && order.id > 0;
+    const orderId = isRealTime ? order.id : -Math.floor(Date.now() / 1000);
+    const syncStatus = order.sync_status || 'new';
+    const isLocal = syncStatus === 'synced' ? 0 : 1;
     
     try {
-        console.log('[DEBUG] Inserting sale_order with ID:', localOrderId);
+        console.log('[DEBUG] Inserting sale_order with ID:', orderId, 'Status:', syncStatus);
         await db.runAsync(
-            `INSERT INTO sale_orders (id, name, partner_name, partner_id, date_order, state, amount_total, sync_status, is_local, user_id, user_name) VALUES (?, ?, ?, ?, ?, ?, ?, 'new', 1, ?, ?)`,
-            [localOrderId, `Local/${localOrderId}`, order.partner_name, order.partner_id || null, order.date_order, 'draft', order.amount_total, order.user_id, order.user_name]
+            `INSERT INTO sale_orders (id, name, partner_name, partner_id, date_order, state, amount_total, sync_status, is_local, user_id, user_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [orderId, order.name || `Local/${orderId}`, order.partner_name, order.partner_id || null, order.date_order, order.state || 'draft', order.amount_total, syncStatus, isLocal, order.user_id, order.user_name]
         );
 
         for (const l of lines) {
             const localLineId = -Math.floor(Math.random() * 1000000);
-            console.log('[DEBUG] Inserting line with ID:', localLineId, 'for order:', localOrderId);
             await db.runAsync(
-                `INSERT INTO sale_order_lines (id, order_id, product_id, product_name, product_uom_qty, price_unit, price_subtotal, sync_status, is_local) VALUES (?, ?, ?, ?, ?, ?, ?, 'new', 1)`,
-                [localLineId, localOrderId, l.product_id, l.product_name, l.quantity, l.price, l.quantity * l.price]
+                `INSERT INTO sale_order_lines (id, order_id, product_id, product_name, product_uom_qty, price_unit, price_subtotal, sync_status, is_local) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [localLineId, orderId, l.product_id, l.product_name, l.quantity, l.price, l.quantity * l.price, syncStatus, isLocal]
             );
         }
         console.log('[DEBUG] Sale order saved locally with success.');
@@ -408,50 +410,70 @@ export const setInvoiceSiatStatusLocal = async (invoiceId: number, status: strin
     );
 };
 
-export const createInvoiceLocal = async (orderId: number, userId: number | null = null, userName: string | null = null) => {
-    console.log('[DEBUG] createInvoiceLocal called for orderId:', orderId);
+export const createInvoiceLocal = async (orderId: number, userId: number | null = null, userName: string | null = null, forceId: number | null = null, forceStatus: string = 'new') => {
+    await initDB();
     const db = await getDb();
+    console.log('[DEBUG] createInvoiceLocal called for orderId:', orderId, 'Status:', forceStatus);
     
     try {
         const order: any = await db.getFirstAsync('SELECT * FROM sale_orders WHERE id = ?', [orderId]);
         if (!order) throw new Error('Order not found');
 
-        const localInvoiceId = -Math.floor(Date.now() / 1000);
-        console.log('[DEBUG] Inserting invoice with ID:', localInvoiceId, 'origin:', order.name);
+        const lines: any[] = await db.getAllAsync('SELECT * FROM sale_order_lines WHERE order_id = ?', [orderId]);
+        
+        const invoiceId = forceId || -Math.floor(Date.now() / 1000);
+        const isLocal = forceStatus === 'synced' ? 0 : 1;
+
+        await db.execAsync('BEGIN TRANSACTION');
         
         await db.runAsync(
-            `INSERT INTO account_moves (id, name, partner_id, partner_name, invoice_date, amount_total, amount_residual, state, payment_state, move_type, origin_order_id, sync_status, is_local, invoice_user_id, invoice_user_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', 1, ?, ?)`,
+            `INSERT INTO account_moves (id, name, partner_id, partner_name, move_type, state, payment_state, invoice_date, amount_total, amount_residual, invoice_user_id, invoice_user_name, sync_status, is_local, origin_order_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
-                localInvoiceId, 
-                `INV/Local/${localInvoiceId}`, 
+                invoiceId, 
+                order.name || `Local/INV/${invoiceId}`, 
                 order.partner_id, 
                 order.partner_name, 
-                new Date().toISOString().split('T')[0], 
-                order.amount_total, 
-                order.amount_total, 
+                'out_invoice', 
                 'posted', 
                 'not_paid', 
-                'out_invoice', 
-                orderId,
-                userId,
-                userName
+                order.date_order, 
+                order.amount_total, 
+                order.amount_total,
+                userId, 
+                userName, 
+                forceStatus, 
+                isLocal, 
+                orderId
             ]
         );
 
-        const lines: any[] = await db.getAllAsync('SELECT * FROM sale_order_lines WHERE order_id = ?', [orderId]);
         for (const l of lines) {
-            const localInvLineId = -Math.floor(Math.random() * 1000000);
+            const lineId = -Math.floor(Math.random() * 1000000);
             await db.runAsync(
-                `INSERT INTO account_move_lines (id, move_id, product_id, product_name, quantity, price_unit, price_subtotal, sync_status, is_local) VALUES (?, ?, ?, ?, ?, ?, ?, 'new', 1)`,
-                [localInvLineId, localInvoiceId, l.product_id, l.product_name, l.product_uom_qty, l.price_unit, l.price_subtotal]
+                `INSERT INTO account_move_lines (id, move_id, product_id, product_name, quantity, price_unit, price_subtotal, sync_status, is_local)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    lineId, 
+                    invoiceId, 
+                    l.product_id, 
+                    l.product_name, 
+                    l.product_uom_qty || l.quantity || 0, 
+                    l.price_unit || l.price || 0, 
+                    l.price_subtotal || 0, 
+                    forceStatus, 
+                    isLocal
+                ]
             );
         }
 
-        await db.runAsync('UPDATE sale_orders SET invoice_id = ? WHERE id = ?', [localInvoiceId, orderId]);
-        console.log('[DEBUG] Invoice saved locally with success.');
-        return localInvoiceId;
+        await db.runAsync('UPDATE sale_orders SET invoice_id = ?, sync_status = "modified" WHERE id = ?', [invoiceId, orderId]);
+        await db.execAsync('COMMIT');
+        
+        return invoiceId;
     } catch (e: any) {
-        console.error('[ERROR] Failed to create invoice locally:', e.message, e);
+        await db.execAsync('ROLLBACK');
+        console.error('Failed to generate local invoice:', e.message);
         throw e;
     }
 };

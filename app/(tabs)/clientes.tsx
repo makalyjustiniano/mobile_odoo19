@@ -9,7 +9,8 @@ import {
   Alert,
   ActivityIndicator,
   Image,
-  Dimensions
+  Dimensions,
+  RefreshControl
 } from 'react-native';
 import MapView, { Marker, PROVIDER_GOOGLE } from 'react-native-maps';
 import * as Location from 'expo-location';
@@ -52,7 +53,10 @@ export default function Index() {
   }, [isOffline]);
 
   const [result, setResult] = useState<Partner[]>([]);
+  const [filteredResult, setFilteredResult] = useState<Partner[]>([]);
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
   const [modalVisible, setModalVisible] = useState(false);
   const [detailModalVisible, setDetailModalVisible] = useState(false);
   const [selectedPartner, setSelectedPartner] = useState<Partner | null>(null);
@@ -95,17 +99,19 @@ export default function Index() {
     longitudeDelta: 0.02,
   });
 
-  const fetchPartners = async () => {
+  const fetchPartners = async (isPullToRefresh = false) => {
     try {
-      setLoading(true);
+      if (isPullToRefresh) setRefreshing(true);
+      else setLoading(true);
       
       // 1. CARGA INSTANTÁNEA (Siempre de SQLite primero)
       console.log('Cargando clientes de SQLite...');
       const localData = await db.getPartners();
       setResult(localData as any);
-      if (localData.length > 0) setLoading(false);
+      setFilteredResult(localData as any);
+      if (localData.length > 0 && !isPullToRefresh) setLoading(false);
 
-      // 2. ACTUALIZACIÓN EN SEGUNDO PLANO (Si online)
+      // 2. ACTUALIZACIÓN EN SEGUNDO PLANO (Si online o si se pide pull-refresh)
       if (!isOffline) {
         console.log('Sincronizando clientes con Odoo...');
         try {
@@ -123,13 +129,14 @@ export default function Index() {
               "x_studio_pago_a_proveedor", "x_studio_pago_de_cliente", "x_studio_tipo_de_documento",
               "user_id", "company_id", "partner_latitude", "partner_longitude"
             ],
-            limit: 200
+            limit: 250 // Aumentamos un poco el limite
           }, true);
           
           if (odooData && Array.isArray(odooData)) {
               await db.savePartners(odooData);
               const freshLocal = await db.getPartners();
               setResult(freshLocal as any);
+              setFilteredResult(freshLocal as any);
           }
         } catch (e) {
           console.warn('Fallo actualización online de clientes.');
@@ -139,6 +146,39 @@ export default function Index() {
       console.error('Error fetchPartners:', error.message);
     } finally {
       setLoading(false);
+      setRefreshing(false);
+    }
+  };
+
+  const handleSearch = async (text: string) => {
+    setSearchQuery(text);
+    if (!text.trim()) {
+      setFilteredResult(result);
+      return;
+    }
+
+    const filtered = result.filter(p => 
+      p.display_name.toLowerCase().includes(text.toLowerCase()) ||
+      (p.vat && p.vat.toLowerCase().includes(text.toLowerCase()))
+    );
+    setFilteredResult(filtered);
+
+    // Si no hay resultados locales y estamos online, buscamos en Odoo
+    if (filtered.length === 0 && !isOffline && text.length > 2) {
+        try {
+            const user = useAuthStore.getState().user;
+            const odooRes = await callOdoo('res.partner', 'search_read', {
+                domain: [['name', 'ilike', text]],
+                fields: ["display_name", "vat", "email", "phone", "image_128"],
+                limit: 10
+            }, true);
+            if (odooRes && odooRes.length > 0) {
+                // Combinamos sin duplicar IDs
+                setFilteredResult(odooRes as any);
+            }
+        } catch (e) {
+            console.log('Online search fail');
+        }
     }
   };
 
@@ -370,9 +410,33 @@ export default function Index() {
         </TouchableOpacity>
       </View>
 
-      <ScrollView contentContainerStyle={{ gap: 16, padding: 15 }}>
-        {loading && <ActivityIndicator color="#714B67" />}
-        {result.map((partner) => (
+      <View style={styles.searchContainer}>
+        <FontAwesome name="search" size={16} color="#9CA3AF" style={styles.searchIcon} />
+        <TextInput
+            style={styles.searchInput}
+            placeholder="Buscar por nombre o NIT..."
+            value={searchQuery}
+            onChangeText={handleSearch}
+        />
+        {searchQuery.length > 0 && (
+            <TouchableOpacity onPress={() => handleSearch('')}>
+                <FontAwesome name="times-circle" size={18} color="#9CA3AF" />
+            </TouchableOpacity>
+        )}
+      </View>
+
+      <ScrollView 
+        contentContainerStyle={{ gap: 16, padding: 15 }}
+        refreshControl={
+            <RefreshControl 
+                refreshing={refreshing} 
+                onRefresh={() => fetchPartners(true)} 
+                colors={['#714B67']}
+            />
+        }
+      >
+        {loading && !refreshing && <ActivityIndicator color="#714B67" />}
+        {filteredResult.map((partner) => (
           <TouchableOpacity 
             key={partner.id.toString()} 
             style={styles.card}
@@ -500,10 +564,10 @@ export default function Index() {
                     </>
                   ) : (
                     <>
-                      <DetailRow icon="id-card" label="NIT/CI" value={selectedPartner.vat} />
-                      <DetailRow icon="envelope" label="Email" value={selectedPartner.email} />
-                      <DetailRow icon="phone" label="Teléfono" value={selectedPartner.phone} />
-                      <DetailRow icon="language" label="Idioma" value={selectedPartner.lang} />
+                      <DetailRow icon="id-card" label="NIT/CI" value={selectedPartner?.vat} />
+                      <DetailRow icon="envelope" label="Email" value={selectedPartner?.email} />
+                      <DetailRow icon="phone" label="Teléfono" value={selectedPartner?.phone} />
+                      <DetailRow icon="language" label="Idioma" value={selectedPartner?.lang} />
                     </>
                   )}
                 </View>
@@ -521,10 +585,10 @@ export default function Index() {
                     </>
                   ) : (
                     <>
-                      <DetailRow icon="map-marker" label="Calle" value={selectedPartner.street} />
-                      {!!selectedPartner.street2 && <DetailRow icon="map-marker" label="Calle 2" value={selectedPartner.street2} />}
-                      <DetailRow icon="building" label="Ciudad" value={selectedPartner.city} />
-                      <DetailRow icon="envelope-o" label="Código Postal" value={selectedPartner.zip} />
+                      <DetailRow icon="map-marker" label="Calle" value={selectedPartner?.street} />
+                      {!!selectedPartner?.street2 && <DetailRow icon="map-marker" label="Calle 2" value={selectedPartner?.street2} />}
+                      <DetailRow icon="building" label="Ciudad" value={selectedPartner?.city} />
+                      <DetailRow icon="envelope-o" label="Código Postal" value={selectedPartner?.zip} />
                     </>
                   )}
                 </View>
@@ -533,18 +597,18 @@ export default function Index() {
                   <View style={styles.section}>
                     <Text style={styles.sectionTitle}>RESUMEN FINANCIERO</Text>
                     <View style={styles.financeGrid}>
-                      <FinanceItem label="Por Cobrar" value={selectedPartner.credit} color="#10B981" />
-                      <FinanceItem label="Por Pagar" value={selectedPartner.debit} color="#EF4444" />
-                      <FinanceItem label="Vencido" value={selectedPartner.total_overdue} color="#F59E0B" />
-                      <FinanceItem label="Límite" value={selectedPartner.credit_limit} color="#6B7280" />
+                      <FinanceItem label="Por Cobrar" value={selectedPartner?.credit} color="#10B981" />
+                      <FinanceItem label="Por Pagar" value={selectedPartner?.debit} color="#EF4444" />
+                      <FinanceItem label="Vencido" value={selectedPartner?.total_overdue} color="#F59E0B" />
+                      <FinanceItem label="Límite" value={selectedPartner?.credit_limit} color="#6B7280" />
                     </View>
                   </View>
                 )}
 
-                {!isEditing && !!selectedPartner.comment && (
+                {!isEditing && !!selectedPartner?.comment && (
                   <View style={styles.section}>
                     <Text style={styles.sectionTitle}>NOTAS</Text>
-                    <Text style={styles.commentText}>{selectedPartner.comment}</Text>
+                    <Text style={styles.commentText}>{selectedPartner?.comment}</Text>
                   </View>
                 )}
 
@@ -578,16 +642,16 @@ export default function Index() {
                     </View>
                   ) : (
                     <View>
-                      <DetailRow icon="briefcase" label="Razón Social" value={selectedPartner.x_studio_razon_social} />
-                      <DetailRow icon="plus-square" label="Complemento" value={selectedPartner.x_studio_complemento} />
-                      <DetailRow icon="industry" label="Giro" value={selectedPartner.x_studio_giro} />
-                      <DetailRow icon="file-text-o" label="Tipo de Documento" value={selectedPartner.x_studio_tipo_de_documento} />
-                      <DetailRow icon="money" label="Pago a Proveedor" value={selectedPartner.x_studio_pago_a_proveedor} />
-                      <DetailRow icon="credit-card" label="Pago de Cliente" value={selectedPartner.x_studio_pago_de_cliente} />
+                      <DetailRow icon="briefcase" label="Razón Social" value={selectedPartner?.x_studio_razon_social} />
+                      <DetailRow icon="plus-square" label="Complemento" value={selectedPartner?.x_studio_complemento} />
+                      <DetailRow icon="industry" label="Giro" value={selectedPartner?.x_studio_giro} />
+                      <DetailRow icon="file-text-o" label="Tipo de Documento" value={selectedPartner?.x_studio_tipo_de_documento} />
+                      <DetailRow icon="money" label="Pago a Proveedor" value={selectedPartner?.x_studio_pago_a_proveedor} />
+                      <DetailRow icon="credit-card" label="Pago de Cliente" value={selectedPartner?.x_studio_pago_de_cliente} />
                       <Text style={[styles.sectionTitle, { marginTop: 15 }]}>UBICACIÓN</Text>
-                      <DetailRow icon="globe" label="Latitud" value={selectedPartner.partner_latitude?.toString()} />
-                      <DetailRow icon="globe" label="Longitud" value={selectedPartner.partner_longitude?.toString()} />
-                      {(selectedPartner.partner_latitude != null && selectedPartner.partner_longitude != null) && (
+                      <DetailRow icon="globe" label="Latitud" value={selectedPartner?.partner_latitude?.toString()} />
+                      <DetailRow icon="globe" label="Longitud" value={selectedPartner?.partner_longitude?.toString()} />
+                      {(selectedPartner?.partner_latitude != null && selectedPartner?.partner_longitude != null) && (
                         <TouchableOpacity style={[styles.locationBtn, { marginTop: 10 }]} onPress={() => handleOpenMap('view')}>
                           <FontAwesome name="map-marker" size={14} color="#fff" />
                           <Text style={styles.locationBtnText}> VER EN MAPA</Text>
@@ -728,9 +792,32 @@ const styles = StyleSheet.create({
     borderRadius: 8,
   },
   newButtonText: {
-    color: '#fff',
-    fontWeight: 'bold',
     marginLeft: 5,
+  },
+  searchContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#fff',
+    margin: 15,
+    marginBottom: 0,
+    paddingHorizontal: 15,
+    borderRadius: 12,
+    height: 48,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 2,
+  },
+  searchIcon: {
+    marginRight: 10,
+  },
+  searchInput: {
+    flex: 1,
+    fontSize: 15,
+    color: '#111827',
   },
   card: {
     backgroundColor: '#fff',

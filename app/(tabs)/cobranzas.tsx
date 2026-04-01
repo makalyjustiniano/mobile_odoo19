@@ -66,8 +66,27 @@ export default function CobranzasScreen() {
     const [selectedJournal, setSelectedJournal] = useState<number | null>(null);
     const [paymentMemo, setPaymentMemo] = useState('');
     const [submittingPayment, setSubmittingPayment] = useState(false);
+    const [searchQuery, setSearchQuery] = useState('');
+    const [filteredInvoices, setFilteredInvoices] = useState<AccountMove[]>([]);
 
     const isOffline = useConfigStore((state) => state.isOffline);
+
+    const handleSearch = (text: string) => {
+        setSearchQuery(text);
+        if (!text.trim()) {
+            setFilteredInvoices(invoices);
+            return;
+        }
+        const filtered = invoices.filter(inv => 
+            inv.partner_id[1].toLowerCase().includes(text.toLowerCase()) ||
+            inv.name.toLowerCase().includes(text.toLowerCase())
+        );
+        setFilteredInvoices(filtered);
+    };
+
+    useEffect(() => {
+        setFilteredInvoices(invoices);
+    }, [invoices]);
 
     const fetchInvoices = async () => {
         try {
@@ -396,9 +415,14 @@ export default function CobranzasScreen() {
     return (
         <View style={styles.container}>
             <View style={styles.topHeader}>
-                <View>
+                <View style={styles.header}>
                     <Text style={styles.headerTitle}>Cobranzas</Text>
-                    <Text style={styles.headerSub}>{invoices.length} facturas pendientes</Text>
+                    <View style={styles.headerIcons}>
+                        {isOffline && <FontAwesome name="flash" size={16} color="#F59E0B" style={{ marginRight: 10 }} />}
+                        <TouchableOpacity onPress={fetchInvoices} disabled={loading}>
+                            <FontAwesome name="refresh" size={20} color="#714B67" />
+                        </TouchableOpacity>
+                    </View>
                 </View>
                 <View style={styles.totalBadge}>
                     <Text style={styles.totalBadgeLabel}>TOTAL GENERAL</Text>
@@ -406,8 +430,23 @@ export default function CobranzasScreen() {
                 </View>
             </View>
 
+            <View style={styles.searchContainer}>
+                <FontAwesome name="search" size={16} color="#9CA3AF" style={styles.searchIcon} />
+                <TextInput
+                    style={styles.searchInput}
+                    placeholder="Buscar por cliente o factura..."
+                    value={searchQuery}
+                    onChangeText={handleSearch}
+                />
+                {searchQuery.length > 0 && (
+                    <TouchableOpacity onPress={() => handleSearch('')}>
+                        <FontAwesome name="times-circle" size={18} color="#9CA3AF" />
+                    </TouchableOpacity>
+                )}
+            </View>
+
             <FlatList
-                data={invoices}
+                data={filteredInvoices}
                 keyExtractor={(item) => item.id.toString()}
                 renderItem={renderItem}
                 contentContainerStyle={styles.listContent}
@@ -518,14 +557,44 @@ const styles = StyleSheet.create({
         justifyContent: 'space-between',
         alignItems: 'center',
     },
+    header: {
+        flexDirection: 'row',
+        alignItems: 'center',
+    },
     headerTitle: {
         fontSize: 22,
         fontWeight: 'bold',
+        color: '#714B67',
+    },
+    searchContainer: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: '#fff',
+        margin: 15,
+        marginBottom: 5,
+        paddingHorizontal: 15,
+        borderRadius: 12,
+        height: 48,
+        borderWidth: 1,
+        borderColor: '#E5E7EB',
+        elevation: 2,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 1 },
+        shadowOpacity: 0.1,
+        shadowRadius: 2,
+    },
+    searchIcon: {
+        marginRight: 10,
+    },
+    searchInput: {
+        flex: 1,
+        fontSize: 15,
         color: '#111827',
     },
-    headerSub: {
-        fontSize: 13,
-        color: '#6B7280',
+    headerIcons: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        marginLeft: 15,
     },
     totalBadge: {
         backgroundColor: '#714B67',
