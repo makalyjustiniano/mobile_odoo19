@@ -148,30 +148,6 @@ export const callOdooRpc = async (
  * Función especial para extraer la API Key y Metadatos desde el HTML del Dashboard
  * Útil para usuarios portal que no tienen permisos RPC pero sí ven el dashboard web.
  */
-export const fetchSiatMetadataFromHtml = async (url: string, sessionId: string): Promise<{apiKey?: string, companyName?: string}> => {
-    try {
-        const dashboardUrl = `${url.endsWith('/') ? url.slice(0, -1) : url}/siat/dashboard`;
-        const response = await fetch(dashboardUrl, {
-            headers: {
-                'X-Odoo-Session': sessionId,
-                'Cookie': `session_id=${sessionId}`
-            }
-        });
-        const html = await response.text();
-        
-        const apiKeyMatch = html.match(/data-api-key="([^"]+)"/);
-        const companyNameMatch = html.match(/data-company-name="([^"]+)"/);
-        
-        return {
-            apiKey: apiKeyMatch ? apiKeyMatch[1] : undefined,
-            companyName: companyNameMatch ? companyNameMatch[1] : undefined,
-        };
-    } catch (e) {
-        console.warn('HTML Discovery failed:', e);
-        return {};
-    }
-};
-
 /**
  * Initial Test function to verify connection using Fetch
  */
@@ -198,7 +174,6 @@ export const testConnection = async (url: string, apiKey: string, database: stri
     }
 
     const contacts = await response.json();
-    console.log('¡Conexión Exitosa!', contacts);
     return contacts;
   } catch (error) {
     console.error('Error en la prueba de conexión:', error);
@@ -208,12 +183,10 @@ export const testConnection = async (url: string, apiKey: string, database: stri
 
 /**
  * Autenticación SIAT Portal (Adaptada al flujo estándar de Odoo)
- * No requiere cambios en el servidor.
  */
 export const loginSiat = async (url: string, database: string, username: string, password: string) => {
   const baseUrl = url.endsWith('/') ? url.slice(0, -1) : url;
   
-  // 1. Autenticación Estándar (Session)
   const authUrl = `${baseUrl}/web/session/authenticate`;
   const authBody = {
     jsonrpc: "2.0",
@@ -233,133 +206,104 @@ export const loginSiat = async (url: string, database: string, username: string,
   });
 
   const authData = await response.json();
-  console.log('--- RPC AUTH RAW RESPONSE ---', JSON.stringify(authData, null, 2));
-
   if (authData.error) {
     throw new Error(authData.error.data?.message || 'Credenciales incorrectas');
   }
 
   const session = authData.result || {};
   const uid = session.uid;
-
-  // 1. Extraer Session ID con búsqueda exhaustiva
   let sessionId = session.session_id || session.sid || session.id || "";
   
-  // Intento de extraer desde las cabeceras si no está en el body (Set-Cookie)
   if (!sessionId && response.headers.get('Set-Cookie')) {
     const cookies = response.headers.get('Set-Cookie') || "";
     const match = cookies.match(/session_id=([^; ]+)/);
     if (match) sessionId = match[1];
   }
   
-  // Si sigue vacío, probamos a buscar cualquier cadena de ~40 caracteres en el result
-  if (!sessionId) {
-    for (const key in session) {
-      if (typeof session[key] === 'string' && session[key].length >= 30 && /^[a-f0-9]+$/.test(session[key])) {
-        sessionId = session[key];
-        break;
-      }
-    }
-  }
-
-  // 2. Capturar la API Key si el servidor la devuelve directamente
-  const apiKey = session.api_key || session.apiKey || session.siat_api_key || session.siat_api_key_connection || "";
-
-  // 3. Capturar Company ID con fallbacks robustos
-  const companyId = session.company_id || 
-                    session.user_companies?.current_company || 
-                    session.user_context?.allowed_company_ids?.[0] || 
-                    1; // Fallback a 1 si el portal devuelve 0
+  const apiKey = session.api_key || session.apiKey || "";
+  const companyId = session.company_id || session.user_context?.allowed_company_ids?.[0] || 1;
 
   return {
-    uid: uid,
+    uid,
     name: session.name || username,
     company_id: companyId,
     company_name: session.user_companies?.current_company_name || session.company_name || "Compañía Principal",
-    database: database,
-    sessionId: sessionId, 
-    apiKey: apiKey,
+    database,
+    sessionId, 
+    apiKey,
     permissions: null
   };
 };
 
 /**
- * Paso 2: Recuperar Metadatos y Permisos de SIAT usando la API Key de Superusuario
+ * Paso 2: Recuperar Metadatos y Permisos de SIAT (RPC Nativo)
+ * Usa la Master API Key (autoridad de sistema) para consultar los privilegios del Portal.
  */
 export const fetchPortalMetadata = async (
     uid: number, 
-    companyId: number,
-    connection?: OdooConnection
+    connection: OdooConnection
 ): Promise<any> => {
-    const { url, database, sessionId } = connection || {};
-    if (!url || !sessionId) {
-        throw new Error("No se puede sincronizar metadatos sin una sesión activa.");
+    const { url, database, apiKey } = connection;
+    
+    // Necesitamos la Master API Key para consultar res.users (niveles de acceso de sistema)
+    if (!url || !apiKey) {
+        throw new Error("API Key Maestra no disponible para consulta de privilegios.");
     }
 
     try {
-        let roleCodes: string[] = [];
-        let isPortalAdmin = false;
-        let siatApiKey = "";
-        let userData: any = null;
-
-        // 1. Obtener datos mínimos del usuario (solo campos permitidos para portal)
-        try {
-            const userInfo = await callOdooRpc(url, 'res.users', 'search_read', [], {
-                domain: [['id', '=', uid]],
-                fields: ["display_name", "company_id", "siat_portal_role_ids"],
-                limit: 1
-            }, sessionId, database);
-            userData = userInfo?.[0];
-        } catch (e) {
-            console.warn('RPC: Falló lectura mínima de usuario (esperado para portal):', e);
-        }
+        console.log(`[OdooClient] Fetching metadata for UID ${uid} via Admin Dispatch...`);
         
-        if (userData) {
-            // 2. Intentar obtener códigos de rol (silencioso)
-            try {
-                const roleIds = userData.siat_portal_role_ids || [];
-                if (roleIds.length > 0) {
-                    const roles = await callOdooRpc(url, 'siat.portal.role', 'search_read', [], {
-                        domain: [['id', 'in', roleIds]],
-                        fields: ["code"]
-                    }, sessionId, database);
-                    roleCodes = roles?.map((r: any) => r.code) || [];
-                }
-            } catch (e) { console.warn('RPC: No se pudieron leer roles del portal.'); }
+        // 2.1 Obtener datos del usuario (roles y grupos) con autoridad de Admin
+        // En Odoo 19, el campo es 'group_ids' en lugar de 'groups_id'
+        const userRes = await callOdoo('res.users', 'search_read', {
+            domain: [["id", "=", uid]],
+            fields: ["siat_portal_role_ids", "group_ids", "company_id", "company_ids"],
+            limit: 1
+        }, true, connection);
 
-            // 3. Intentar obtener API Key de la Empresa vía RPC (silencioso)
-            try {
-                const companies = await callOdooRpc(url, 'res.company', 'search_read', [], {
-                    domain: [['id', '=', companyId]],
-                    fields: ["siat_api_key_connection"],
-                    limit: 1
-                }, sessionId, database);
-                siatApiKey = companies?.[0]?.siat_api_key_connection || "";
-            } catch (e) { console.warn('RPC: No se pudo leer API Key de empresa.'); }
+        const userData = userRes?.[0];
+        if (!userData) throw new Error("No se pudo encontrar el usuario portal vía RPC Administrador.");
+
+        const roleIds = userData.siat_portal_role_ids || [];
+        const groupIds = userData.group_ids || [];
+        const mainCompanyId = Array.isArray(userData.company_id) ? userData.company_id[0] : userData.company_id || 1;
+        const allCompanyIds = userData.company_ids || [mainCompanyId];
+
+        // 2.2 Verificar si es Admin del Portal (siat_portal_web.group_siat_portal_admin)
+        // Buscamos el ID del grupo por su XML ID
+        const adminGroup = await callOdoo('ir.model.data', 'search_read', {
+            domain: [['module', '=', 'siat_portal_web'], ['name', '=', 'group_siat_portal_admin']],
+            fields: ['res_id'],
+            limit: 1
+        }, true, connection);
+        
+        const adminGroupId = adminGroup?.[0]?.res_id;
+        const isPortalAdmin = adminGroupId ? groupIds.includes(adminGroupId) : false;
+
+        // 2.3 Obtener códigos de rol de la tabla siat.portal.role
+        let roleCodes: string[] = [];
+        if (roleIds.length > 0) {
+            const roles = await callOdoo('siat.portal.role', 'search_read', {
+                domain: [['id', 'in', roleIds]],
+                fields: ["code"]
+            }, true, connection);
+            roleCodes = roles?.map((r: any) => r.code) || [];
         }
 
-        // 4. FALLBACK CRÍTICO: Si no tenemos API Key vía RPC, la intentamos descubrir en el HTML
-        if (!siatApiKey) {
-            console.log('--- Iniciando Discovery vía HTML (Portal Fallback) ---');
-            const discovery = await fetchSiatMetadataFromHtml(url, sessionId);
-            if (discovery.apiKey) {
-                console.log('--- API Key descubierta vía HTML! ---');
-                siatApiKey = discovery.apiKey;
-            }
-        }
+        console.log(`[OdooClient] Roles detectados: [${roleCodes.join(', ')}]. Admin: ${isPortalAdmin}`);
 
         const permissions = getPortalPermissions(roleCodes, isPortalAdmin);
         
         return {
             permissions,
-            siatApiKey: siatApiKey || (connection?.apiKey || "") 
+            roleCodes,
+            isAdmin: isPortalAdmin,
+            companyIds: allCompanyIds,
+            companyId: mainCompanyId,
+            apiKey: connection.apiKey
         };
     } catch (error: any) {
-        console.error('Error al recuperar metadatos (ignorado):', error.message);
-        // Retornamos metadatos vacíos en lugar de fallar el login
-        return {
-            permissions: getPortalPermissions([], false),
-            siatApiKey: connection?.apiKey || ""
-        };
+        console.error("[OdooClient] RPC Metadata Discovery failed:", error.message);
+        throw error;
     }
 };

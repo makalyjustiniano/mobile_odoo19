@@ -60,7 +60,7 @@ export default function LoginScreen() {
 
       // Paso 2: Recuperar Metadatos y API Key de Sucursal usando la autoridad del Perfil
       const activeProfile = getActiveProfile();
-      const portalInfo = await fetchPortalMetadata(authData.uid, authData.company_id, {
+      const portalInfo = await fetchPortalMetadata(authData.uid, {
         url,
         database,
         apiKey: (authData as any).apiKey || activeProfile?.apiKey || '',
@@ -70,6 +70,8 @@ export default function LoginScreen() {
       
       const finalApiKey = portalInfo?.siatApiKey || activeProfile?.apiKey || '';
       const finalPermissions = portalInfo?.permissions || null;
+      const finalCompanyIds = portalInfo?.companyIds || [authData.company_id];
+      const finalCompanyId = portalInfo?.companyId || authData.company_id;
 
       // Si tiene éxito, guardamos en Auth y actualizamos el Perfil activo
       login({ 
@@ -79,7 +81,8 @@ export default function LoginScreen() {
         username,
         name: authData.name,
         uid: authData.uid,
-        company_id: authData.company_id,
+        company_id: finalCompanyId,
+        company_ids: finalCompanyIds,
         company_name: authData.company_name,
         permissions: finalPermissions
       });

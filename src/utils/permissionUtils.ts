@@ -26,18 +26,16 @@ export interface SiatPermissions {
  * Idéntico a _get_portal_permissions en Odoo.
  */
 export const getPortalPermissions = (roleCodes: string[], isPortalAdmin: boolean): SiatPermissions => {
+    // SEGURIDAD ESTRICTA: Solo usamos los roles explícitamente asignados en Odoo.
+    // Si no hay roles y no es admin, no se otorga acceso a ningún módulo.
     const roles = new Set(roleCodes);
     
-    // Si no hay roles y no es admin, Odoo aplica compatibilidad hacia atrás habilitando todo (según _get_role_codes)
-    if (roleCodes.length === 0 && !isPortalAdmin) {
-        roles.add("sales_quote");
-        roles.add("sales_confirm");
-        roles.add("distribution");
-        roles.add("collections");
+    // Si es admin, otorgamos todos los roles automáticamente
+    if (isPortalAdmin) {
+        ["admin", "sales_quote", "sales_confirm", "distribution", "collections"].forEach(r => roles.add(r));
     }
-
     const canSales = roles.has("sales_quote") || roles.has("sales_confirm") || isPortalAdmin;
-    const canConfirmSalesViewInvoice = roles.has("sales_confirm") || isPortalAdmin;
+    const canInvoices = roles.has("sales_confirm") || isPortalAdmin;
     const canConfirmSales = roles.has("sales_confirm") || isPortalAdmin;
     const canDistribution = roles.has("distribution") || isPortalAdmin;
     const canCollections = roles.has("collections") || isPortalAdmin;
@@ -49,7 +47,7 @@ export const getPortalPermissions = (roleCodes: string[], isPortalAdmin: boolean
         create_sale: roles.has("sales_quote") || canConfirmSales,
         edit_sale: roles.has("sales_quote") || canConfirmSales,
         confirm_sale: canConfirmSales,
-        view_invoices: canConfirmSalesViewInvoice || canCollections,
+        view_invoices: canInvoices || canCollections,
         send_invoice_siat: canConfirmSales,
         annul_invoice_siat: canConfirmSales,
         view_contacts: canSales || canCollections,
@@ -62,74 +60,69 @@ export const getPortalPermissions = (roleCodes: string[], isPortalAdmin: boolean
     };
 };
 
+
+
+
 /**
- * Genera el dominio de Odoo (o filtro SQLite) para cada modelo.
- * Reclica _sale_domain_for_user, _invoice_domain_for_user, etc.
+ * Genera el dominio de Odoo para cada modelo.
+ * Reclica EXACTAMENTE _sale_domain_for_user, _invoice_domain_for_user de Odoo.
+ * Implementa "FILTER-FIRST" para optimizar descarga.
  */
 export const getSiatDomain = (model: string, user: any, permissions?: SiatPermissions): any[] => {
     if (!user) return [];
     
-    // Si no se pasan los permisos, los calculamos del usuario (emulando Odoo)
     const perms = permissions || getPortalPermissions(user.role_codes || [], !!user.is_portal_admin);
-    const companyIds = user.company_ids || [user.company_id];
+    const companyIds = user.company_ids || (user.company_id ? [user.company_id] : []);
     const uid = Number(user.uid || user.id);
     
-    // Filtro base de compañía: (Pertenece a mis compañías O es registro global)
-    const companyFilter = ["|", ["company_id", "in", companyIds], ["company_id", "=", false]];
+    // Filtro base de Sucursal: ESTRICTO.
+    const branchFilter = ["company_id", "in", companyIds];
 
     if (perms.is_admin) {
         if (model === 'account.move') {
             return [
-                "&", 
-                companyFilter[0], companyFilter[1], companyFilter[2], // Desglosamos el filtro de compañía
+                "&", branchFilter,
                 "&", ["move_type", "=", "out_invoice"],
                 "&", ["state", "=", "posted"], ["amount_residual", ">", 0]
             ];
         }
-        return companyFilter;
+        return [branchFilter];
     }
 
-    // Para no-admins, aplicamos [ & , |(comp, global) , user ]
-    // Esto garantiza que Odoo procese: (Comp OR Global) AND (User)
+    // No-admins: Aplicamos filtros cruzados (Sucursal AND Vendedor/Usuario)
     switch (model) {
         case 'sale.order':
             return [
-                "&", 
-                "|", ["company_id", "in", companyIds], ["company_id", "=", false],
+                "&", branchFilter,
                 ["user_id", "=", uid]
             ];
         case 'account.move':
             return [
-                "&", 
-                "|", ["company_id", "in", companyIds], ["company_id", "=", false],
+                "&", branchFilter,
                 "&", ["move_type", "=", "out_invoice"],
                 "&", ["state", "=", "posted"],
                 "&", ["amount_residual", ">", 0], ["invoice_user_id", "=", uid]
             ];
         case 'stock.picking':
             return [
-                "&", 
-                "|", ["company_id", "in", companyIds], ["company_id", "=", false],
+                "&", branchFilter,
                 "&", ["picking_type_code", "=", "outgoing"], ["user_id", "=", uid]
             ];
         case 'stock.move':
             return [
-                "&", 
-                "|", ["company_id", "in", companyIds], ["company_id", "=", false],
+                "&", branchFilter,
                 "&", ["picking_id.picking_type_code", "=", "outgoing"], ["picking_id.user_id", "=", uid]
             ];
         case 'account.payment':
             return [
-                "&", 
-                "|", ["company_id", "in", companyIds], ["company_id", "=", false],
+                "&", branchFilter,
                 "&", ["partner_type", "=", "customer"],
                 "&", ["payment_type", "=", "inbound"], ["kral_user_id", "=", uid]
             ];
         case 'res.partner':
-            return [
-                "|", ["company_id", "in", companyIds], ["company_id", "=", false]
-            ];
+            return [branchFilter];
     }
 
-    return companyFilter;
+    return [branchFilter];
 };
+

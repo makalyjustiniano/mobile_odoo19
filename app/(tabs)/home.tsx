@@ -5,6 +5,7 @@ import { useRouter } from 'expo-router';
 import { usePartnerStore } from '../../src/store/usePartnerStore';
 import { useProductStore } from '../../src/store/useProductStore';
 import { useConfigStore } from '../../src/store/configStore';
+import { useAuthStore } from '../../src/store/authStore';
 import { runSync } from '../../src/services/syncService';
 
 const { width } = Dimensions.get('window');
@@ -12,6 +13,7 @@ const COLUMN_WIDTH = (width - 40) / 2; // Subtracting padding
 
 export default function DashboardScreen() {
   const router = useRouter();
+  const permissions = useAuthStore((state) => state.user?.permissions);
 
   const menuItems = [
     {
@@ -19,44 +21,51 @@ export default function DashboardScreen() {
       icon: 'users',
       color: '#714B67',
       route: '/(tabs)/clientes',
+      visible: permissions?.view_contacts,
     },
     {
       title: 'Auto-Ventas',
       icon: 'shopping-cart',
       color: '#00A09D',
       route: '/(tabs)/ventas',
+      visible: permissions?.view_sales,
     },
     {
       title: 'Distribución',
       icon: 'truck',
       color: '#3B82F6',
       route: '/(tabs)/distribucion',
+      visible: permissions?.view_pickings,
     },
     {
       title: 'Cobranzas',
       icon: 'money',
       color: '#10B981',
       route: '/(tabs)/cobranzas',
+      visible: permissions?.view_receivables,
     },
     {
       title: 'Cartera',
       icon: 'folder-open',
       color: '#714B67',
       route: '/(tabs)/cartera',
+      visible: permissions?.view_receivables,
     },
     {
       title: 'Configuración',
       icon: 'cog',
       color: '#10B9ff',
       route: '/(tabs)/configuracion',
+      visible: true,
     },
     {
       title: 'Sincronizar',
       icon: 'refresh',
       color: '#F59E0B',
       action: 'sync',
+      visible: true,
     },
-  ];
+  ].filter(item => item.visible);
 
   const isOffline = useConfigStore((state) => state.isOffline);
 
