@@ -27,7 +27,7 @@ export const submitPickingDelivery = async (
     }, silent);
 };
 
-export const runSync = async (onProgress?: (msg: string) => void) => {
+export const syncPortalMetadata = async (onProgress?: (msg: string) => void) => {
     const { user, updateUser } = useAuthStore.getState();
     const { getActiveProfile } = useConfigStore.getState();
     const activeProfile = getActiveProfile();
@@ -38,14 +38,11 @@ export const runSync = async (onProgress?: (msg: string) => void) => {
     const url = user?.url || activeProfile?.url;
 
     if (!uid || !url || !database) {
-        throw new Error("No hay un usuario identificado o faltan datos de conexión.");
+        console.warn('[SYNC] No hay datos suficientes para refrescar metadatos.');
+        return null;
     }
 
-    // 0. ACTUALIZACIÓN CRÍTICA DE PERMISOS
     onProgress?.('Verificando privilegios...');
-    let permissions = user?.permissions;
-    let companyIds = user?.company_ids || [user?.company_id || 1];
-
     try {
         const portalInfo = await fetchPortalMetadata(uid, {
             url,
@@ -55,23 +52,36 @@ export const runSync = async (onProgress?: (msg: string) => void) => {
         });
         
         if (portalInfo && portalInfo.permissions) {
-            permissions = portalInfo.permissions;
-            companyIds = portalInfo.companyIds || companyIds;
             const updatedApiKey = portalInfo.apiKey || portalInfo.siatApiKey || apiKey;
-            
+            const companyIds = portalInfo.companyIds || user?.company_ids || [user?.company_id || 1];
+
             updateUser({ 
-                permissions, 
+                permissions: portalInfo.permissions, 
                 company_id: portalInfo.companyId || (user as any).company_id,
                 company_ids: companyIds,
                 apiKey: updatedApiKey
             });
             console.log('[SYNC] Privilegios actualizados con éxito.');
+            return portalInfo;
         }
     } catch (e) {
-        console.warn('[SYNC] No se pudieron refrescar los privilegios (usando caché):', e);
+        console.warn('[SYNC] No se pudieron refrescar los privilegios:', (e as any).message);
+    }
+    return null;
+};
+
+export const runSync = async (onProgress?: (msg: string) => void) => {
+    const { user } = useAuthStore.getState();
+    const uid = user?.uid;
+
+    if (!uid) {
+        throw new Error("No hay un usuario identificado.");
     }
 
-    const effectivePermissions = permissions || {
+    // 0. ACTUALIZACIÓN CRÍTICA DE PERMISOS
+    const portalInfo = await syncPortalMetadata(onProgress);
+    
+    const effectivePermissions = portalInfo?.permissions || user?.permissions || {
         is_admin: false,
         view_sales: false,
         view_invoices: false,
@@ -80,6 +90,9 @@ export const runSync = async (onProgress?: (msg: string) => void) => {
         view_receivables: false,
         role_codes: []
     };
+
+    const companyIds = portalInfo?.companyIds || user?.company_ids || [user?.company_id || 1];
+
 
     try {
         await db.initDB();

@@ -22,7 +22,7 @@ import { useConfigStore } from '../../src/store/configStore';
 import { usePartnerStore } from '../../src/store/usePartnerStore';
 import { useProductStore } from '../../src/store/useProductStore';
 import * as db from '../../src/services/dbService';
-import { uploadOfflineChanges } from '../../src/services/syncService';
+import { uploadOfflineChanges, syncPortalMetadata } from '../../src/services/syncService';
 import { getSiatDomain } from '../../src/utils/permissionUtils';
 import { useAuthStore } from '../../src/store/authStore';
 
@@ -155,8 +155,11 @@ export default function VentasScreen() {
 
             // 2. ACTUALIZACIÓN EN SEGUNDO PLANO (Si online)
             if (!isOffline) {
-                console.log('Sincronizando historial de ventas con Odoo...');
+                console.log('Verificando privilegios y sincronizando historial...');
                 try {
+                    // Refrescar metadatos y permisos primero
+                    await syncPortalMetadata();
+
                     const user = useAuthStore.getState().user;
                     const saleDomain = getSiatDomain('sale.order', user);
                     
