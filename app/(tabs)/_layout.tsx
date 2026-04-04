@@ -113,7 +113,7 @@ export default function TabLayout() {
                 name="inventario"
                 options={{
                     title: 'Inventario',
-                    href: permissions?.view_pickings ? undefined : null, // Linked to distribution
+                    href: permissions?.view_inventory ? undefined : null,
                     tabBarIcon: ({ color }) => <FontAwesome name="archive" size={24} color={color} />,
                 }}
             />

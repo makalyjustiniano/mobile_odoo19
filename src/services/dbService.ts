@@ -211,6 +211,7 @@ export const initDB = async () => {
             id INTEGER PRIMARY KEY,
             display_name TEXT,
             list_price REAL,
+            qty_available REAL DEFAULT 0,
             sync_status TEXT DEFAULT 'synced',
             is_local INTEGER DEFAULT 0
         )`);
@@ -274,6 +275,10 @@ export const initDB = async () => {
                 } else {
                     await addColumnIfMissing(table, 'user_id', "INTEGER");
                 }
+            }
+
+            if (table === 'products') {
+                await addColumnIfMissing(table, 'qty_available', "REAL DEFAULT 0");
             }
 
             if (table === 'sale_orders' || table === 'stock_moves') {
@@ -383,8 +388,8 @@ export const createSaleOrderLocal = async (order: any, lines: any[]) => {
     try {
         console.log('[DEBUG] Inserting sale_order with ID:', orderId, 'Status:', syncStatus);
         await db.runAsync(
-            `INSERT INTO sale_orders (id, name, partner_name, partner_id, date_order, state, amount_total, sync_status, is_local, user_id, user_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [orderId, order.name || `Local/${orderId}`, order.partner_name, order.partner_id || null, order.date_order, order.state || 'draft', order.amount_total, syncStatus, isLocal, order.user_id, order.user_name]
+            `INSERT INTO sale_orders (id, name, partner_name, partner_id, date_order, state, amount_total, sync_status, is_local, user_id, user_name, company_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [orderId, order.name || `Local/${orderId}`, order.partner_name, order.partner_id || null, order.date_order, order.state || 'draft', order.amount_total, syncStatus, isLocal, order.user_id, order.user_name, order.company_id]
         );
 
         for (const l of lines) {
@@ -863,8 +868,8 @@ export const saveProducts = async (products: any[]) => {
     try {
         for (const p of products) {
             await db.runAsync(
-                `INSERT OR REPLACE INTO products (id, display_name, list_price) VALUES (?, ?, ?)`,
-                [p.id, p.display_name, p.list_price || 0]
+                `INSERT OR REPLACE INTO products (id, display_name, list_price, qty_available) VALUES (?, ?, ?, ?)`,
+                [p.id, p.display_name, p.list_price || 0, p.qty_available || 0]
             );
         }
         await db.execAsync('COMMIT');
@@ -884,7 +889,7 @@ export const searchProducts = async (query: string) => {
     await initDB();
     const db = await getDb();
     return await db.getAllAsync(
-        'SELECT id, display_name, list_price FROM products WHERE display_name LIKE ? LIMIT 5',
+        'SELECT id, display_name, list_price, qty_available FROM products WHERE display_name LIKE ? LIMIT 5',
         [`%${query}%`]
     );
 };

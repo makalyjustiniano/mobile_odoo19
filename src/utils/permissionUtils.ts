@@ -35,19 +35,20 @@ export const getPortalPermissions = (roleCodes: string[], isPortalAdmin: boolean
         ["admin", "sales_quote", "sales_confirm", "distribution", "collections"].forEach(r => roles.add(r));
     }
     const canSales = roles.has("sales_quote") || roles.has("sales_confirm") || isPortalAdmin;
-    const canInvoices = roles.has("sales_confirm") || isPortalAdmin;
     const canConfirmSales = roles.has("sales_confirm") || isPortalAdmin;
+    const canCreateSales = roles.has("sales_quote") || isPortalAdmin;
     const canDistribution = roles.has("distribution") || isPortalAdmin;
     const canCollections = roles.has("collections") || isPortalAdmin;
+    const canViewInventory = canDistribution || roles.has("sales_quote") || isPortalAdmin;
 
     return {
         is_admin: isPortalAdmin,
         role_codes: Array.from(roles).sort(),
         view_sales: canSales,
-        create_sale: roles.has("sales_quote") || canConfirmSales,
-        edit_sale: roles.has("sales_quote") || canConfirmSales,
+        create_sale: canCreateSales,
+        edit_sale: canCreateSales,
         confirm_sale: canConfirmSales,
-        view_invoices: canInvoices || canCollections,
+        view_invoices: roles.has("sales_confirm") || roles.has("collections") || isPortalAdmin,
         send_invoice_siat: canConfirmSales,
         annul_invoice_siat: canConfirmSales,
         view_contacts: canSales || canCollections,
@@ -57,6 +58,7 @@ export const getPortalPermissions = (roleCodes: string[], isPortalAdmin: boolean
         view_receivables: canCollections,
         create_receipts: canCollections,
         view_settings: isPortalAdmin,
+        view_inventory: canViewInventory,
     };
 };
 

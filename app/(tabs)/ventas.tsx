@@ -100,7 +100,8 @@ export default function VentasScreen() {
     const [invoiceModalVisible, setInvoiceModalVisible] = useState(false);
     const [selectedInvoice, setSelectedInvoice] = useState<Invoice | null>(null);
     const [loadingInvoice, setLoadingInvoice] = useState(false);
-
+    const { user } = useAuthStore();
+    const permissions = user?.permissions;
     const isOffline = useConfigStore((state) => state.isOffline);
 
     // Form state
@@ -254,13 +255,17 @@ export default function VentasScreen() {
             try {
                 const results = await callOdoo('product.product', 'search_read', {
                     domain: [['name', 'ilike', query], ['sale_ok', '=', true]],
-                    fields: ['display_name', 'list_price'],
+                    fields: ['display_name', 'list_price', 'qty_available'],
                     limit: 10
                 }, true); // Silent = true
                 
                 const productArray = Array.isArray(results) ? results : (results?.result || []);
                 if (productArray.length > 0) {
-                    setProducts(productArray);
+                    const normalizedProducts = productArray.map((p: any) => ({
+                        ...p,
+                        qty_available: p.qty_available ?? 0
+                    }));
+                    setProducts(normalizedProducts);
                 }
             } catch (error) {
                 console.log('Online product search failed, using local SQLite.');
@@ -328,7 +333,8 @@ export default function VentasScreen() {
                 date_order: new Date().toISOString().replace('T', ' ').substring(0, 19),
                 amount_total: amountTotal,
                 user_id: user?.uid || null,
-                user_name: user?.name || ''
+                user_name: user?.name || '',
+                company_id: user?.company_id || 1
             };
 
             // 1. INTENTO DE OPERACIÓN EN TIEMPO REAL (Si online)
@@ -344,10 +350,9 @@ export default function VentasScreen() {
                     const createRes: any = await callOdoo('sale.order', 'create', {
                         vals_list: [{
                             partner_id: commonVals.partner_id,
-                            user_id: commonVals.user_id, // Responsable mobile
+                            user_id: commonVals.user_id,
+                            company_id: user?.company_id || 1, // Enforce branch context
                             order_line: orderLinesOdoo,
-                            // El servidor asignará name y date_order si no los pasamos, 
-                            // pero los incluimos para consistencia local
                         }]
                     });
 
@@ -707,7 +712,7 @@ export default function VentasScreen() {
                     </View>
                     
                     <View style={styles.actionRow}>
-                        {(item.state === 'draft' || item.state === 'sent') && (
+                        {( (item.state === 'draft' || item.state === 'sent') && permissions?.confirm_sale ) && (
                             <TouchableOpacity
                                 style={styles.confirmInlineButton}
                                 onPress={() => confirmExistingOrder(item.id)}
@@ -717,7 +722,7 @@ export default function VentasScreen() {
                             </TouchableOpacity>
                         )}
 
-                        {item.state === 'sale' && !item.invoice_id && (
+                        {item.state === 'sale' && !item.invoice_id && permissions?.confirm_sale && (
                             <TouchableOpacity
                                 style={styles.invoiceButton}
                                 onPress={() => handleCreateInvoice(item.id)}
@@ -727,7 +732,7 @@ export default function VentasScreen() {
                             </TouchableOpacity>
                         )}
 
-                        {item.invoice_id && (
+                        {item.invoice_id && permissions?.view_invoices && (
                             <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                                 <TouchableOpacity
                                     style={styles.viewInvoiceButton}
@@ -751,9 +756,20 @@ export default function VentasScreen() {
         <View style={styles.container}>
             <View style={styles.header}>
                 <Text style={styles.headerTitle}>Ventas / Sectores</Text>
-                <TouchableOpacity onPress={fetchData} disabled={loading}>
-                    <FontAwesome name="refresh" size={20} color="#714B67" />
-                </TouchableOpacity>
+                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                    {permissions?.create_sale && (
+                        <TouchableOpacity 
+                            style={[styles.newButton, { marginRight: 15 }]} 
+                            onPress={() => setModalVisible(true)}
+                        >
+                            <FontAwesome name="plus" size={14} color="#fff" />
+                            <Text style={styles.newButtonText}>NUEVA</Text>
+                        </TouchableOpacity>
+                    )}
+                    <TouchableOpacity onPress={fetchData} disabled={loading}>
+                        <FontAwesome name="refresh" size={20} color="#714B67" />
+                    </TouchableOpacity>
+                </View>
             </View>
 
             <View style={styles.searchContainer}>
@@ -808,39 +824,6 @@ export default function VentasScreen() {
 
                         <ScrollView style={styles.modalBody} keyboardShouldPersistTaps="handled">
                             
-                            {/* Product Selection (AHORA ARRIBA POR PEDIDO DEL USUARIO) */}
-                            <Text style={[styles.inputLabel, { color: '#00A09D' }]}>1. Agregar Productos</Text>
-                            <View style={styles.searchWrapper}>
-                                <TextInput
-                                    style={styles.searchInput}
-                                    placeholder="Nombre del producto..."
-                                    value={productSearch}
-                                    onChangeText={searchProducts}
-                                />
-                                {showProductResults && (
-                                    <View style={[styles.searchResults, { zIndex: 100, elevation: 5 }]}>
-                                        {products.length > 0 ? (
-                                            products.map(p => (
-                                                <TouchableOpacity
-                                                    key={p.id}
-                                                    style={styles.resultItem}
-                                                    onPress={() => addProductToQuote(p)}
-                                                >
-                                                    <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
-                                                        <Text style={{ flex: 1, color: '#374151' }}>{p.display_name}</Text>
-                                                        <Text style={{ fontWeight: 'bold' }}>Bs. {p.list_price}</Text>
-                                                    </View>
-                                                </TouchableOpacity>
-                                            ))
-                                        ) : (
-                                            <View style={{ padding: 12 }}>
-                                                <Text style={{ color: '#9CA3AF', fontStyle: 'italic', fontSize: 13 }}>No se encontraron productos</Text>
-                                            </View>
-                                        )}
-                                    </View>
-                                )}
-                            </View>
-
                             {/* Partner Selection (AHORA ABAJO POR PEDIDO DEL USUARIO) */}
                             <Text style={[styles.inputLabel, { marginTop: 25, color: '#00A09D' }]}>2. Seleccionar Cliente</Text>
                             {selectedPartner ? (
@@ -884,6 +867,46 @@ export default function VentasScreen() {
                                 </View>
                             )}
 
+                             {/* Product Selection (AHORA ARRIBA POR PEDIDO DEL USUARIO) */}
+                            <Text style={[styles.inputLabel, { color: '#00A09D' }]}>1. Agregar Productos</Text>
+                            <View style={styles.searchWrapper}>
+                                <TextInput
+                                    style={styles.searchInput}
+                                    placeholder="Nombre del producto..."
+                                    value={productSearch}
+                                    onChangeText={searchProducts}
+                                />
+                                {showProductResults && (
+                                    <View style={[styles.searchResults, { zIndex: 100, elevation: 5 }]}>
+                                        {products.length > 0 ? (
+                                            products.map(p => (
+                                                <TouchableOpacity
+                                                    key={p.id}
+                                                    style={styles.resultItem}
+                                                    onPress={() => addProductToQuote(p)}
+                                                >
+                                                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                                                        <View style={{ flex: 1.5 }}>
+                                                            <Text style={{ color: '#374151', fontSize: 13, fontWeight: '500' }}>{p.display_name}</Text>
+                                                            {p.qty_available !== undefined && (
+                                                                <Text style={{ color: (p.qty_available > 0 ? '#10B981' : '#EF4444'), fontSize: 11 }}>
+                                                                    Stock: {p.qty_available % 1 === 0 ? p.qty_available : p.qty_available.toFixed(2)}
+                                                                </Text>
+                                                            )}
+                                                        </View>
+                                                        <Text style={{ fontWeight: 'bold', color: '#111827' }}>Bs. {p.list_price}</Text>
+                                                    </View>
+                                                </TouchableOpacity>
+                                            ))
+                                        ) : (
+                                            <View style={{ padding: 12 }}>
+                                                <Text style={{ color: '#9CA3AF', fontStyle: 'italic', fontSize: 13 }}>No se encontraron productos</Text>
+                                            </View>
+                                        )}
+                                    </View>
+                                )}
+                            </View>
+
                             <Text style={[styles.inputLabel, { marginTop: 20 }]}>Productos Seleccionados</Text>
                             {quoteLines.length === 0 ? (
                                 <Text style={styles.placeholderText}>No se han agregado productos aún.</Text>
@@ -918,15 +941,17 @@ export default function VentasScreen() {
                                 ))
                             )}
 
-                            <View style={styles.toggleRow}>
-                                <Text style={styles.inputLabel}>¿Confirmar Orden Automáticamente?</Text>
-                                <TouchableOpacity
-                                    onPress={() => setShouldConfirm(!shouldConfirm)}
-                                    style={[styles.toggleSwitch, shouldConfirm && styles.toggleSwitchActive]}
-                                >
-                                    <View style={[styles.toggleCircle, shouldConfirm && styles.toggleCircleActive]} />
-                                </TouchableOpacity>
-                            </View>
+                            {permissions?.confirm_sale && (
+                                <View style={styles.toggleRow}>
+                                    <Text style={styles.inputLabel}>¿Confirmar Orden Automáticamente?</Text>
+                                    <TouchableOpacity
+                                        onPress={() => setShouldConfirm(!shouldConfirm)}
+                                        style={[styles.toggleSwitch, shouldConfirm && styles.toggleSwitchActive]}
+                                    >
+                                        <View style={[styles.toggleCircle, shouldConfirm && styles.toggleCircleActive]} />
+                                    </TouchableOpacity>
+                                </View>
+                            )}
 
                             <View style={{ height: 100 }} />
                         </ScrollView>

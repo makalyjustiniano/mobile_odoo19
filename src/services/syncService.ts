@@ -292,9 +292,10 @@ export const runSync = async (onProgress?: (msg: string) => void) => {
             onProgress?.('Sincronizando productos y métodos...');
             const products = await callOdoo('product.product', 'search_read', {
                 domain: [['sale_ok', '=', true]],
-                fields: ['display_name', 'list_price'],
+                fields: ['display_name', 'list_price', 'qty_available'],
                 limit: 500
             });
+            console.log(`[SYNC] Productos recibidos: ${products?.length}. Primer producto:`, products?.[0] ? JSON.stringify(products[0]) : 'vacío');
             await db.clearTable('products');
             if (products?.length > 0) await db.saveProducts(products);
 
