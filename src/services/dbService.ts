@@ -647,6 +647,15 @@ export const saveSaleOrders = async (orders: any[]) => {
                 }
             }
 
+            // Manejar invoice_id: Si Odoo no lo tiene (null), pero localmente ya tiene uno (negativo), conservamos el local
+            let invoiceId = Array.isArray(o.invoice_ids) && o.invoice_ids.length > 0 ? o.invoice_ids[0] : null;
+            if (!invoiceId) {
+                const existing: any = await db.getFirstAsync('SELECT invoice_id FROM sale_orders WHERE id = ?', [o.id]);
+                if (existing && existing.invoice_id < 0) {
+                    invoiceId = existing.invoice_id;
+                }
+            }
+
             await db.runAsync(
                 `INSERT OR REPLACE INTO sale_orders (id, name, display_name, partner_id, partner_name, date_order, state, amount_total, invoice_id, company_id, user_id, user_name) 
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -659,7 +668,7 @@ export const saveSaleOrders = async (orders: any[]) => {
                     o.date_order || '',
                     o.state || '',
                     o.amount_total || 0,
-                    Array.isArray(o.invoice_ids) && o.invoice_ids.length > 0 ? o.invoice_ids[0] : null,
+                    invoiceId,
                     Array.isArray(o.company_id) ? o.company_id[0] : (o.company_id || 0),
                     extractId(o.user_id),
                     extractName(o.user_id)
@@ -684,7 +693,7 @@ export const saveSaleOrders = async (orders: any[]) => {
             }
         }
         await db.execAsync('COMMIT');
-        console.log(`[SQLITE] Éxito: ${orders.length} pedidos de venta guardados.`);
+        console.log(`[SQLITE] Éxito: ${orders.length} pedidos guardados.`);
     } catch (e) {
         await db.execAsync('ROLLBACK');
         console.error('Error guardando sale_orders:', e);
@@ -727,8 +736,8 @@ export const saveAccountMoves = async (moves: any[]) => {
     try {
         for (const m of moves) {
             await db.runAsync(
-                `INSERT OR REPLACE INTO account_moves (id, name, partner_id, partner_name, move_type, state, payment_state, invoice_date, invoice_date_due, amount_total, amount_residual, invoice_user_id, invoice_user_name, company_id, siat_status, siat_url, siat_qr_content, siat_cuf, sync_status) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'synced')`,
+                `INSERT OR REPLACE INTO account_moves (id, name, partner_id, partner_name, move_type, state, payment_state, invoice_date, invoice_date_due, amount_total, amount_residual, invoice_user_id, invoice_user_name, company_id, origin_order_id, siat_status, siat_url, siat_qr_content, siat_cuf, sync_status) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'synced')`,
                 [
                     m.id || 0,
                     m.name || '',
@@ -744,6 +753,7 @@ export const saveAccountMoves = async (moves: any[]) => {
                     extractId(m.invoice_user_id),
                     extractName(m.invoice_user_id),
                     m.company_id ? extractId(m.company_id) : 0,
+                    m.origin_order_id || 0,
                     m.siat_estado || 'no_enviado',
                     m.siat_qr_string || '',
                     m.siat_qr_image || '',
@@ -1128,18 +1138,22 @@ export const deleteLocalDatabase = async () => {
 
 export const backupDatabase = async () => {
     try {
-        const FileSystem = require('expo-file-system');
-        const dbName = 'odoo_mobile.db';
+        // Use legacy import as suggested by Expo 54+ warning
+        const FileSystem = require('expo-file-system/legacy');
+        
+        // IMPORTANT: Use the correct DB_NAME defined at top of file
+        const dbName = DB_NAME; 
         const dbPath = `${FileSystem.documentDirectory}SQLite/${dbName}`;
         
         const backupDir = `${FileSystem.documentDirectory}Backups/`;
         const dirInfo = await FileSystem.getInfoAsync(backupDir);
+        
         if (!dirInfo.exists) {
             await FileSystem.makeDirectoryAsync(backupDir, { intermediates: true });
         }
 
         const dateStr = new Date().toISOString().replace(/[:.]/g, '-');
-        const backupPath = `${backupDir}odoo_mobile_backup_${dateStr}.db`;
+        const backupPath = `${backupDir}${dbName.replace('.db', '')}_backup_${dateStr}.db`;
 
         await FileSystem.copyAsync({
             from: dbPath,
@@ -1148,9 +1162,9 @@ export const backupDatabase = async () => {
         
         console.log('Backup exitoso en:', backupPath);
         return backupPath;
-    } catch (error) {
-        console.error('Error creando backup de la base de datos:', error);
-        return null;
+    } catch (e: any) {
+        console.error('Error creando backup de la base de datos:', e);
+        throw e;
     }
 };
 

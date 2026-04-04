@@ -14,7 +14,7 @@ import { FontAwesome } from '@expo/vector-icons';
 import { Picker } from '@react-native-picker/picker';
 import { useConfigStore } from '../../src/store/configStore';
 import { useAuthStore } from '../../src/store/authStore';
-import { uploadOfflineChanges, backupAndPurgeDatabase } from '../../src/services/syncService';
+import { uploadOfflineChanges, backupAndPurgeDatabase, performSafeLogout } from '../../src/services/syncService';
 import { printerService, PrinterDevice } from '../../src/services/printerService';
 import { startAutoSync, stopAutoSync } from '../../src/services/autoSyncService';
 
@@ -108,8 +108,8 @@ export default function ConfiguracionScreen() {
 
   const handleSyncAndLogout = async () => {
     Alert.alert(
-      'Confirmar Sincronización',
-      'Se subirán tus cambios locales a Odoo, se creará un respaldo de seguridad y se cerrará la sesión actual para limpiar el dispositivo.',
+      'Confirmar Sincronización y Salida',
+      'Se subirán tus cambios locales a Odoo y se cerrará la sesión. Si hay datos pendientes y falla la conexión, la salida será bloqueada por seguridad.',
       [
         { text: 'Cancelar', style: 'cancel' },
         { 
@@ -117,10 +117,13 @@ export default function ConfiguracionScreen() {
           onPress: async () => {
             setSyncing(true);
             try {
-              await uploadOfflineChanges((msg) => setSyncMessage(msg));
-              await backupAndPurgeDatabase((msg) => setSyncMessage(msg));
-              Alert.alert('Éxito', 'Sincronización y backup completados.');
-              logout();
+              const { success, message } = await performSafeLogout((msg) => setSyncMessage(msg));
+              if (success) {
+                  Alert.alert('Éxito', 'Sincronización completada.');
+                  logout();
+              } else {
+                  Alert.alert('Bloqueo de Seguridad', message);
+              }
             } catch (error: any) {
               Alert.alert('Error', 'Problema al sincronizar: ' + error.message);
             } finally {

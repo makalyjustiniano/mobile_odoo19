@@ -6,7 +6,7 @@ import { usePartnerStore } from '../../src/store/usePartnerStore';
 import { useProductStore } from '../../src/store/useProductStore';
 import { useConfigStore } from '../../src/store/configStore';
 import { useAuthStore } from '../../src/store/authStore';
-import { runSync } from '../../src/services/syncService';
+import { uploadAndSync } from '../../src/services/syncService';
 
 const { width } = Dimensions.get('window');
 const COLUMN_WIDTH = (width - 40) / 2; // Subtracting padding
@@ -69,14 +69,22 @@ export default function DashboardScreen() {
 
   const isOffline = useConfigStore((state) => state.isOffline);
 
+  const [isSyncing, setIsSyncing] = React.useState(false);
+
   const handleSync = async () => {
+    if (isSyncing) return;
+    setIsSyncing(true);
     try {
-      console.log('Starting full sync to SQLite...');
-      await runSync((msg: string) => console.log(msg));
-      Alert.alert('Éxito', 'Sincronización completa (Clientes, Productos y Ventas) finalizada.');
+      console.log('Starting full bidirectional sync...');
+      await uploadAndSync((msg: string) => {
+          console.log(msg);
+      });
+      Alert.alert('Éxito', 'Sincronización total finalizada. Cambios locales subidos y datos actualizados desde Odoo.');
     } catch (error: any) {
         console.error('Sync error:', error);
         Alert.alert('Error', 'No se pudo sincronizar con Odoo: ' + error.message);
+    } finally {
+        setIsSyncing(false);
     }
   };
 

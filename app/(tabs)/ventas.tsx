@@ -22,7 +22,7 @@ import { useConfigStore } from '../../src/store/configStore';
 import { usePartnerStore } from '../../src/store/usePartnerStore';
 import { useProductStore } from '../../src/store/useProductStore';
 import * as db from '../../src/services/dbService';
-import { uploadOfflineChanges, syncPortalMetadata } from '../../src/services/syncService';
+import { runSync, uploadAndSync, syncInvoicesByIds } from '../../src/services/syncService';
 import { getSiatDomain } from '../../src/utils/permissionUtils';
 import { useAuthStore } from '../../src/store/authStore';
 import ListFilters, { DateFilterType } from '../../src/components/ListFilters';
@@ -201,6 +201,26 @@ export default function VentasScreen() {
         }
     };
 
+    const handleManualSync = async () => {
+        setLoading(true);
+        try {
+            const { success, errors } = await uploadAndSync((msg) => console.log(`[MANUAL SYNC] ${msg}`));
+            if (!success) {
+                Alert.alert(
+                    'Sincronización Parcial',
+                    `Se descargaron datos de Odoo, pero algunos registros locales no pudieron subirse:\n\n${errors.slice(0, 3).join('\n')}${errors.length > 3 ? '\n...' : ''}`
+                );
+            } else {
+                Alert.alert('Éxito', 'Sincronización completada correctamente.');
+            }
+            await fetchData(true);
+        } catch (error: any) {
+            Alert.alert('Error', 'No se pudo conectar con Odoo: ' + error.message);
+        } finally {
+            setLoading(false);
+        }
+    };
+
     const fetchData = async (isPullToRefresh = false, customOffset?: number) => {
         const currentOffset = customOffset !== undefined ? customOffset : (isPullToRefresh ? 0 : offset);
         if (isPullToRefresh) setOffset(0);
@@ -259,6 +279,15 @@ export default function VentasScreen() {
                     if (orders && Array.isArray(orders)) {
                         // Guardar en SQLite
                         await db.saveSaleOrders(orders);
+                        
+                        // Descargar facturas vinculadas de estos pedidos (IMPORTANTE PARA MODO OFFLINE)
+                        const invoiceIds = orders
+                            .flatMap((o: any) => o.invoice_ids || [])
+                            .filter(id => !!id);
+                        if (invoiceIds.length > 0) {
+                            await syncInvoicesByIds(invoiceIds);
+                        }
+
                         // Recargar de SQLite para consistencia
                         const updatedLocal = await db.getSaleOrders();
                         setResult(updatedLocal as any);
@@ -703,56 +732,68 @@ export default function VentasScreen() {
             setInvoiceModalVisible(true);
             
             if (isOffline) {
+                console.log('[OFFLINE] Cargando detalle de factura local:', invoiceId);
                 const dbInst = await db.getDb();
                 const inv: any = await dbInst.getFirstAsync('SELECT * FROM account_moves WHERE id = ?', [invoiceId]);
                 if (inv) {
                     const lines = await dbInst.getAllAsync('SELECT * FROM account_move_lines WHERE move_id = ?', [invoiceId]);
                     setSelectedInvoice({ ...inv, lines });
+                } else {
+                    Alert.alert('Error Offline', 'No se encontró la factura en la base de datos local.');
                 }
                 return;
             }
 
+            console.log('[ONLINE] Consultando factura en Odoo:', invoiceId);
             const invData: any = await callOdoo('account.move', 'search_read', {
                 domain: [['id', '=', invoiceId]],
                 fields: [
                     'name', 'partner_id', 'invoice_date', 'amount_total', 'amount_residual', 
-                    'invoice_line_ids', 'invoice_user_id', 'access_token',
+                    'invoice_line_ids', 'invoice_user_id', 'access_token', 'state',
                     'siat_estado', 'siat_cuf', 'siat_qr_string', 'siat_qr_image', 'siat_leyenda'
                 ]
             });
 
-            if (invData.length > 0) {
-                const inv = invData[0];
-                const lines = await callOdoo('account.move.line', 'search_read', {
-                    domain: [['move_id', '=', invoiceId], ['display_type', 'not in', ['line_section', 'line_note']]],
-                    fields: ['name', 'quantity', 'price_unit', 'price_subtotal']
+            if (invData && invData.length > 0) {
+                const rawInv = invData[0];
+                
+                // Mapear campos de SIAT (Odoo -> Internal Interface)
+                const mappedInv: Invoice = {
+                    ...rawInv,
+                    partner_name: rawInv.partner_id ? rawInv.partner_id[1] : '',
+                    invoice_user_id: rawInv.invoice_user_id,
+                    invoice_user_name: rawInv.invoice_user_id ? rawInv.invoice_user_id[1] : '',
+                    siat_status: rawInv.siat_estado,
+                    siat_url: rawInv.siat_qr_string,
+                    siat_qr_content: rawInv.siat_qr_image,
+                };
+
+                const lines: any = await callOdoo('account.move.line', 'search_read', {
+                    domain: [['move_id', '=', rawInv.id], ['display_type', 'not in', ['line_section', 'line_note']]],
+                    fields: ['name', 'product_id', 'quantity', 'price_unit', 'price_subtotal']
                 });
 
-                // Optimization: Fetch partner data from LOCAL table first 
+                // Enriquecer con datos de contacto locales si están disponibles para permitir WhatsApp/Email incluso online
                 const dbInst = await db.getDb();
                 const partnerLoc: any = await dbInst.getFirstAsync(
                     'SELECT mobile, phone, email FROM partners WHERE id = ?', 
-                    [inv.partner_id[0]]
+                    [rawInv.partner_id[0]]
                 );
                 
                 const partner = partnerLoc || {};
 
-                setSelectedInvoice({
-                    ...inv,
-                    partner_name: inv.partner_id ? inv.partner_id[1] : (inv as any).partner_name,
+                setSelectedInvoice({ 
+                    ...mappedInv, 
+                    lines,
                     partner_mobile: partner.mobile || partner.phone || '',
-                    partner_email: partner.email || '',
-                    invoice_user_name: inv.invoice_user_id ? inv.invoice_user_id[1] : '',
-                    siat_status: inv.siat_estado,
-                    siat_url: inv.siat_qr_string,
-                    siat_qr_content: inv.siat_qr_image,
-                    siat_cuf: inv.siat_cuf,
-                    siat_leyenda: inv.siat_leyenda,
-                    lines
+                    partner_email: partner.email || '' 
                 });
+            } else {
+                Alert.alert('Error', 'No se pudo encontrar la factura en el servidor.');
             }
-        } catch (error) {
-            console.error('Error fetching invoice details:', error);
+        } catch (error: any) {
+            console.error('Error fetching invoice details:', error.message);
+            Alert.alert('Error', 'Hubo un problema al cargar el detalle de la factura.');
         } finally {
             setLoadingInvoice(false);
         }
@@ -907,7 +948,11 @@ export default function VentasScreen() {
                             <Text style={styles.newButtonText}>NUEVA</Text>
                         </TouchableOpacity>
                     )}
-                    <TouchableOpacity onPress={fetchData} disabled={loading || isAuditMode} style={{opacity: isAuditMode ? 0.3 : 1}}>
+                    <TouchableOpacity 
+                        onPress={handleManualSync} 
+                        disabled={loading || isAuditMode} 
+                        style={{opacity: isAuditMode ? 0.3 : 1}}
+                    >
                         <FontAwesome name="refresh" size={20} color="#714B67" />
                     </TouchableOpacity>
                 </View>

@@ -21,6 +21,7 @@ import { useConfigStore } from '../../src/store/configStore';
 import * as db from '../../src/services/dbService';
 import { getSiatDomain } from '../../src/utils/permissionUtils';
 import { useAuthStore } from '../../src/store/authStore';
+import { syncPortalMetadata, uploadAndSync } from '../../src/services/syncService';
 import ListFilters, { DateFilterType } from '../../src/components/ListFilters';
 
 interface Partner {
@@ -118,6 +119,26 @@ export default function Index() {
     if (newOffset !== offset) {
         setOffset(newOffset);
         fetchPartners(false, newOffset);
+    }
+  };
+
+  const handleManualSync = async () => {
+    setLoading(true);
+    try {
+      const { success, errors } = await uploadAndSync((msg) => console.log(`[MANUAL SYNC] ${msg}`));
+      if (!success) {
+        Alert.alert(
+          'Sincronización Parcial',
+          `Se descargaron datos de Odoo, pero algunos registros locales no pudieron subirse:\n\n${errors.slice(0, 3).join('\n')}${errors.length > 3 ? '\n...' : ''}`
+        );
+      } else {
+        Alert.alert('Éxito', 'Sincronización completada correctamente.');
+      }
+      await fetchPartners(true);
+    } catch (error: any) {
+      Alert.alert('Error', 'No se pudo conectar con Odoo: ' + error.message);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -435,13 +456,22 @@ export default function Index() {
   return (
     <View style={{ flex: 1, backgroundColor: '#F9FAFB' }}>
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>Clientes</Text>
-        {!isAuditMode && (
-          <TouchableOpacity style={styles.newButton} onPress={() => setModalVisible(true)}>
-            <FontAwesome name="plus" size={16} color="#fff" />
-            <Text style={styles.newButtonText}>NUEVO</Text>
+        <Text style={styles.headerTitle}>Gestión de Clientes</Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+          {!isAuditMode && (
+            <TouchableOpacity style={[styles.newButton, { marginRight: 15 }]} onPress={() => setModalVisible(true)}>
+              <FontAwesome name="plus" size={14} color="#fff" />
+              <Text style={styles.newButtonText}> NUEVO</Text>
+            </TouchableOpacity>
+          )}
+          <TouchableOpacity 
+            onPress={() => fetchPartners(true)} 
+            disabled={loading || isAuditMode}
+            style={{ opacity: isAuditMode ? 0.3 : 1 }}
+          >
+            <FontAwesome name="refresh" size={20} color="#714B67" />
           </TouchableOpacity>
-        )}
+        </View>
       </View>
 
       {/* Barra de búsqueda */}

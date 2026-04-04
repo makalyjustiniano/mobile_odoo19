@@ -21,6 +21,7 @@ import { useConfigStore } from '../../src/store/configStore';
 import * as db from '../../src/services/dbService';
 import { getSiatDomain } from '../../src/utils/permissionUtils';
 import { useAuthStore } from '../../src/store/authStore';
+import { syncPortalMetadata, uploadAndSync } from '../../src/services/syncService';
 import ListFilters, { DateFilterType } from '../../src/components/ListFilters';
 
 // Enable LayoutAnimation for Android
@@ -108,6 +109,26 @@ export default function CobranzasScreen() {
         if (newOffset !== offset) {
             setOffset(newOffset);
             fetchInvoices(false, newOffset);
+        }
+    };
+
+    const handleManualSync = async () => {
+        setLoading(true);
+        try {
+            const { success, errors } = await uploadAndSync((msg) => console.log(`[MANUAL SYNC] ${msg}`));
+            if (!success) {
+                Alert.alert(
+                    'Sincronización Parcial',
+                    `Se descargaron datos de Odoo, pero algunos registros locales no pudieron subirse:\n\n${errors.slice(0, 3).join('\n')}${errors.length > 3 ? '\n...' : ''}`
+                );
+            } else {
+                Alert.alert('Éxito', 'Sincronización completada correctamente.');
+            }
+            await fetchInvoices(true);
+        } catch (error: any) {
+            Alert.alert('Error', 'No se pudo conectar con Odoo: ' + error.message);
+        } finally {
+            setLoading(false);
         }
     };
 
@@ -468,7 +489,11 @@ export default function CobranzasScreen() {
                     <Text style={styles.headerTitle}>Cobranzas</Text>
                     <View style={styles.headerIcons}>
                         {isOffline && <FontAwesome name="flash" size={16} color="#F59E0B" style={{ marginRight: 10 }} />}
-                        <TouchableOpacity onPress={() => fetchInvoices(true)} disabled={loading || isAuditMode} style={{opacity: isAuditMode ? 0.3 : 1}}>
+                        <TouchableOpacity 
+                            onPress={handleManualSync} 
+                            disabled={loading || isAuditMode}
+                            style={{ opacity: isAuditMode ? 0.3 : 1 }}
+                        >
                             <FontAwesome name="refresh" size={20} color="#714B67" />
                         </TouchableOpacity>
                     </View>

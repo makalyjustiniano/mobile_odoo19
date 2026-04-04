@@ -5,8 +5,8 @@ import { useAuthStore } from '../../src/store/authStore';
 import { useConfigStore } from '../../src/store/configStore';
 import { View, Text } from 'react-native';
 import { Alert } from 'react-native';
-import { hasUnsyncedData, backupDatabase, deleteLocalDatabase } from '../../src/services/dbService';
-import { backgroundSync } from '../../src/services/syncService';
+import * as db from '../../src/services/dbService';
+import { performSafeLogout } from '../../src/services/syncService';
 
 export default function TabLayout() {
     const router = useRouter();
@@ -21,45 +21,37 @@ export default function TabLayout() {
     const handleLogout = async () => {
         if (isAuditMode) {
              console.log('Saliendo de Modo Auditoría...');
-             await deleteLocalDatabase(); // Destroy the loaded backup DB
+             await db.deleteLocalDatabase(); // Destroy the loaded backup DB
              logout();
              router.replace('/');
              return;
         }
 
-        console.log('Intentando sincronizar antes de Logout...');
-        if (!isOffline) {
-            try {
-                // Forzar un intento de sincronización en background
-                await backgroundSync(null, true);
-            } catch (error) {
-                console.log('Error en sync de logout', error);
-            }
-        }
-
-        const hasUnsynced = await hasUnsyncedData();
-        if (hasUnsynced) {
-            Alert.alert(
-                'Sincronización Pendiente',
-                'Existen datos no sincronizados con Odoo. Por favor, conéctese a internet e intente de nuevo para no perder información.',
-                [{ text: 'Entendido' }]
-            );
-            return; // Bloquea el logout
-        }
-
-        console.log('Ejecutando Logout y respaldando base de datos...');
-        const backupResult = await backupDatabase();
-        if (backupResult) {
-            console.log('Procediendo a vaciar base de datos local...');
-            await deleteLocalDatabase();
-        } else {
-            console.warn('Backup fallido, se procederá con el borrado local de todos modos (Ajustable según política).');
-            await deleteLocalDatabase();
-        }
-
-        logout(); // Limpiamos el estado global (y con ello se borran datos por diseño actual)
-        console.log('Estado limpiado, redirigiendo a /');
-        router.replace('/');
+        Alert.alert(
+            'Confirmar Cierre de Sesión',
+            'Se subirán tus cambios pendientes a Odoo y se borrarán los datos locales por seguridad.',
+            [
+                { text: 'Cancelar', style: 'cancel' },
+                {
+                    text: 'Sincronizar y Salir',
+                    onPress: async () => {
+                        console.log('[LOGOUT] Iniciando salida segura...');
+                        const { success, message } = await performSafeLogout();
+                        
+                        if (success) {
+                            logout();
+                            router.replace('/');
+                        } else {
+                            Alert.alert(
+                                'No se puede cerrar sesión',
+                                message,
+                                [{ text: 'Entendido' }]
+                            );
+                        }
+                    }
+                }
+            ]
+        );
     };
 
     const user = useAuthStore((state) => state.user);
