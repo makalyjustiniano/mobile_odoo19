@@ -21,6 +21,7 @@ import { useConfigStore } from '../../src/store/configStore';
 import * as db from '../../src/services/dbService';
 import { getSiatDomain } from '../../src/utils/permissionUtils';
 import { useAuthStore } from '../../src/store/authStore';
+import ListFilters, { DateFilterType } from '../../src/components/ListFilters';
 
 interface Partner {
   id: number;
@@ -62,6 +63,12 @@ export default function Index() {
   const [selectedPartner, setSelectedPartner] = useState<Partner | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   
+  // Filters state
+  const [limit, setLimit] = useState<number>(250);
+  const [offset, setOffset] = useState<number>(0);
+  const [totalCount, setTotalCount] = useState<number>(0);
+  const [dateFilter, setDateFilter] = useState<DateFilterType>('All');
+  
   // Form state (New Partner)
   const [newName, setNewName] = useState('');
   const [newEmail, setNewEmail] = useState('');
@@ -99,7 +106,24 @@ export default function Index() {
     longitudeDelta: 0.02,
   });
 
-  const fetchPartners = async (isPullToRefresh = false) => {
+  const handleNextPage = () => {
+    if (offset + limit < totalCount) {
+        setOffset(offset + limit);
+        fetchPartners(false, offset + limit);
+    }
+  };
+
+  const handlePrevPage = () => {
+    const newOffset = Math.max(0, offset - limit);
+    if (newOffset !== offset) {
+        setOffset(newOffset);
+        fetchPartners(false, newOffset);
+    }
+  };
+
+  const fetchPartners = async (isPullToRefresh = false, customOffset?: number) => {
+    const currentOffset = customOffset !== undefined ? customOffset : (isPullToRefresh ? 0 : offset);
+    if (isPullToRefresh) setOffset(0);
     try {
       if (isPullToRefresh) setRefreshing(true);
       else setLoading(true);
@@ -129,8 +153,14 @@ export default function Index() {
               "x_studio_pago_a_proveedor", "x_studio_pago_de_cliente", "x_studio_tipo_de_documento",
               "user_id", "company_id", "partner_latitude", "partner_longitude"
             ],
-            limit: 250 // Aumentamos un poco el limite
+            limit: limit,
+            offset: currentOffset
           }, true);
+          
+          const count: number = await callOdoo('res.partner', 'search_count', {
+            domain: partnerDomain
+          }, true);
+          setTotalCount(count);
           
           if (odooData && Array.isArray(odooData)) {
               await db.savePartners(odooData);
@@ -400,30 +430,50 @@ export default function Index() {
     setDetailModalVisible(true);
   };
 
+  const isAuditMode = useAuthStore.getState().isAuditMode;
+
   return (
     <View style={{ flex: 1, backgroundColor: '#F9FAFB' }}>
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Clientes</Text>
-        <TouchableOpacity style={styles.newButton} onPress={() => setModalVisible(true)}>
-          <FontAwesome name="plus" size={16} color="#fff" />
-          <Text style={styles.newButtonText}>NUEVO</Text>
-        </TouchableOpacity>
-      </View>
-
-      <View style={styles.searchContainer}>
-        <FontAwesome name="search" size={16} color="#9CA3AF" style={styles.searchIcon} />
-        <TextInput
-            style={styles.searchInput}
-            placeholder="Buscar por nombre o NIT..."
-            value={searchQuery}
-            onChangeText={handleSearch}
-        />
-        {searchQuery.length > 0 && (
-            <TouchableOpacity onPress={() => handleSearch('')}>
-                <FontAwesome name="times-circle" size={18} color="#9CA3AF" />
-            </TouchableOpacity>
+        {!isAuditMode && (
+          <TouchableOpacity style={styles.newButton} onPress={() => setModalVisible(true)}>
+            <FontAwesome name="plus" size={16} color="#fff" />
+            <Text style={styles.newButtonText}>NUEVO</Text>
+          </TouchableOpacity>
         )}
       </View>
+
+      {/* Barra de búsqueda */}
+      <View style={styles.searchContainer}>
+        <FontAwesome name="search" size={20} color="#714B67" style={styles.searchIcon} />
+        <TextInput
+          style={styles.searchInput}
+          placeholder="Buscar clientes por nombre..."
+          value={searchQuery}
+          onChangeText={handleSearch}
+          placeholderTextColor="#9ca3af"
+        />
+        {searchQuery.length > 0 && (
+          <TouchableOpacity onPress={() => handleSearch('')} style={styles.clearSearchBtn}>
+            <FontAwesome name="times-circle" size={18} color="#9ca3af" />
+          </TouchableOpacity>
+        )}
+      </View>
+
+      <ListFilters
+          limit={limit}
+          setLimit={(v) => { setLimit(v); setOffset(0); }}
+          dateFilter={dateFilter}
+          setDateFilter={(v) => { setDateFilter(v); setOffset(0); }}
+          onApply={() => { setOffset(0); fetchPartners(false); }}
+          showDateFilter={false}
+          disabled={isOffline || useAuthStore.getState().isAuditMode}
+          offset={offset}
+          totalCount={totalCount}
+          onNextPage={handleNextPage}
+          onPrevPage={handlePrevPage}
+      />
 
       <ScrollView 
         contentContainerStyle={{ gap: 16, padding: 15 }}
@@ -519,9 +569,11 @@ export default function Index() {
                 {isEditing ? 'Editar Contacto' : 'Detalles del Contacto'}
               </Text>
               <View style={{ flexDirection: 'row', gap: 15, alignItems: 'center' }}>
-                <TouchableOpacity onPress={() => setIsEditing(!isEditing)}>
-                  <FontAwesome name={isEditing ? "close" : "edit"} size={22} color="#00A09D" />
-                </TouchableOpacity>
+                {!isAuditMode && (
+                  <TouchableOpacity onPress={() => setIsEditing(!isEditing)}>
+                    <FontAwesome name={isEditing ? "close" : "edit"} size={22} color="#00A09D" />
+                  </TouchableOpacity>
+                )}
                 <TouchableOpacity onPress={() => setDetailModalVisible(false)}>
                   <FontAwesome name="times" size={24} color="#6B7280" />
                 </TouchableOpacity>

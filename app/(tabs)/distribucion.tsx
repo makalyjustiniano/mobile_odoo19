@@ -24,6 +24,7 @@ import * as db from '../../src/services/dbService';
 import { runSync, submitPickingDelivery } from '../../src/services/syncService';
 import { getSiatDomain } from '../../src/utils/permissionUtils';
 import { useAuthStore } from '../../src/store/authStore';
+import ListFilters, { DateFilterType } from '../../src/components/ListFilters';
 
 const { width, height } = Dimensions.get('window');
 
@@ -87,6 +88,12 @@ export default function DistribucionScreen() {
     const [deliveryQtyByMove, setDeliveryQtyByMove] = useState<Record<number, string>>({});
     const [submittingGroupKey, setSubmittingGroupKey] = useState<string | null>(null);
     const isOffline = useConfigStore((state) => state.isOffline);
+    
+    // Filters state
+    const [limit, setLimit] = useState<number>(50);
+    const [offset, setOffset] = useState<number>(0);
+    const [totalCount, setTotalCount] = useState<number>(0);
+    const [dateFilter, setDateFilter] = useState<DateFilterType>('Today');
 
     // Route states
     const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set());
@@ -94,7 +101,24 @@ export default function DistribucionScreen() {
     const [optimizedRoute, setOptimizedRoute] = useState<DeliveryGroup[]>([]);
     const [currentPos, setCurrentPos] = useState<{ latitude: number; longitude: number } | null>(null);
 
-    const fetchMoves = async () => {
+    const handleNextPage = () => {
+        if (offset + limit < totalCount) {
+            setOffset(offset + limit);
+            fetchMoves(false, offset + limit);
+        }
+    };
+
+    const handlePrevPage = () => {
+        const newOffset = Math.max(0, offset - limit);
+        if (newOffset !== offset) {
+            setOffset(newOffset);
+            fetchMoves(false, newOffset);
+        }
+    };
+
+    const fetchMoves = async (isPullToRefresh = false, customOffset?: number) => {
+        const currentOffset = customOffset !== undefined ? customOffset : (isPullToRefresh ? 0 : offset);
+        if (isPullToRefresh) setOffset(0);
         try {
             await db.initDB();
             if (!refreshing) setLoading(true);
@@ -106,7 +130,23 @@ export default function DistribucionScreen() {
 
             if (!isOffline) {
                 try {
-                    const stockDomain = getSiatDomain('stock.move', user);
+                    const stockDomain: any[] = getSiatDomain('stock.move', user);
+                    
+                    if (dateFilter !== 'All') {
+                        const today = new Date();
+                        const pad = (n: number) => n.toString().padStart(2, '0');
+                        const formatStr = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+                        if (dateFilter === 'Today') {
+                            stockDomain.push(['date', '>=', `${formatStr(today)} 00:00:00`]);
+                        } else if (dateFilter === '7Days') {
+                            const d = new Date(); d.setDate(d.getDate() - 7);
+                            stockDomain.push(['date', '>=', `${formatStr(d)} 00:00:00`]);
+                        } else if (dateFilter === '30Days') {
+                            const d = new Date(); d.setDate(d.getDate() - 30);
+                            stockDomain.push(['date', '>=', `${formatStr(d)} 00:00:00`]);
+                        }
+                    }
+
                     const fullDomain = [
                         '&', ...stockDomain,
                         '&', ['partner_id', '!=', false],
@@ -119,8 +159,15 @@ export default function DistribucionScreen() {
                             'picking_id', 'reference', 'product_id', 'product_uom_qty', 'product_uom',
                             'state', 'origin', 'partner_id', 'date', 'date_deadline', 'company_id'
                         ],
-                        limit: 300
+                        limit: limit,
+                        offset: currentOffset,
+                        order: 'id desc'
                     }, true);
+
+                    const count: number = await callOdoo('stock.move', 'search_count', {
+                        domain: fullDomain
+                    }, true);
+                    setTotalCount(count);
 
                     if (result && Array.isArray(result)) {
                         result.forEach(m => {
@@ -249,17 +296,20 @@ export default function DistribucionScreen() {
         const isSelected = selectedGroups.has(item.key);
         const totalRequested = item.moves.reduce((acc, move) => acc + Number(move.product_uom_qty || 0), 0);
 
+        const isAuditMode = useAuthStore.getState().isAuditMode;
+
         return (
             <View style={[styles.card, expanded && styles.cardExpanded, isSelected && styles.cardSelected]}>
                 <View style={styles.cardHeaderRow}>
                     <TouchableOpacity 
                         style={styles.checkbox} 
                         onPress={() => toggleSelection(item.key)}
+                        disabled={isAuditMode}
                     >
                         <FontAwesome 
                             name={isSelected ? "check-square" : "square-o"} 
                             size={24} 
-                            color={isSelected ? "#714B67" : "#D1D5DB"} 
+                            color={isAuditMode ? "#E5E7EB" : (isSelected ? "#714B67" : "#D1D5DB")} 
                         />
                     </TouchableOpacity>
 
@@ -298,12 +348,14 @@ export default function DistribucionScreen() {
                                 <Text style={styles.productQty}>{move.product_uom_qty} {move.product_uom ? move.product_uom[1] : ''}</Text>
                             </View>
                         ))}
+                        {!isAuditMode && (
                         <TouchableOpacity 
                             style={styles.deliverButton}
                             onPress={() => handleDeliverGroup(item)}
                         >
                             <Text style={styles.deliverButtonText}>REALIZAR ENTREGA</Text>
                         </TouchableOpacity>
+                        )}
                     </View>
                 )}
             </View>
@@ -331,6 +383,19 @@ export default function DistribucionScreen() {
                 </View>
             </View>
 
+            <ListFilters
+                limit={limit}
+                setLimit={(v) => { setLimit(v); setOffset(0); }}
+                dateFilter={dateFilter}
+                setDateFilter={(v) => { setDateFilter(v); setOffset(0); }}
+                onApply={() => { setOffset(0); fetchMoves(false); }}
+                disabled={isOffline || useAuthStore.getState().isAuditMode}
+                offset={offset}
+                totalCount={totalCount}
+                onNextPage={handleNextPage}
+                onPrevPage={handlePrevPage}
+            />
+
             <FlatList
                 data={groups}
                 keyExtractor={(item) => item.key}
@@ -340,7 +405,7 @@ export default function DistribucionScreen() {
                 ListEmptyComponent={<View style={styles.empty}><FontAwesome name="dropbox" size={50} color="#ccc" /><Text>Sin entregas</Text></View>}
             />
 
-            {selectedGroups.size > 1 && (
+            {!useAuthStore.getState().isAuditMode && selectedGroups.size > 1 && (
                 <TouchableOpacity style={styles.fab} onPress={handleBuildRoute}>
                     <FontAwesome name="map" size={20} color="#fff" />
                     <Text style={styles.fabText}> ARMAR RUTA</Text>

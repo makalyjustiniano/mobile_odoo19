@@ -21,6 +21,7 @@ import { useConfigStore } from '../../src/store/configStore';
 import * as db from '../../src/services/dbService';
 import { getSiatDomain } from '../../src/utils/permissionUtils';
 import { useAuthStore } from '../../src/store/authStore';
+import ListFilters, { DateFilterType } from '../../src/components/ListFilters';
 
 // Enable LayoutAnimation for Android
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
@@ -68,8 +69,15 @@ export default function CobranzasScreen() {
     const [submittingPayment, setSubmittingPayment] = useState(false);
     const [searchQuery, setSearchQuery] = useState('');
     const [filteredInvoices, setFilteredInvoices] = useState<AccountMove[]>([]);
+    
+    // Filters state
+    const [limit, setLimit] = useState<number>(50);
+    const [offset, setOffset] = useState<number>(0);
+    const [totalCount, setTotalCount] = useState<number>(0);
+    const [dateFilter, setDateFilter] = useState<DateFilterType>('Today');
 
     const isOffline = useConfigStore((state) => state.isOffline);
+    const isAuditMode = useAuthStore((state) => state.isAuditMode);
 
     const handleSearch = (text: string) => {
         setSearchQuery(text);
@@ -88,10 +96,27 @@ export default function CobranzasScreen() {
         setFilteredInvoices(invoices);
     }, [invoices]);
 
-    const fetchInvoices = async () => {
+    const handleNextPage = () => {
+        if (offset + limit < totalCount) {
+            setOffset(offset + limit);
+            fetchInvoices(false, offset + limit);
+        }
+    };
+
+    const handlePrevPage = () => {
+        const newOffset = Math.max(0, offset - limit);
+        if (newOffset !== offset) {
+            setOffset(newOffset);
+            fetchInvoices(false, newOffset);
+        }
+    };
+
+    const fetchInvoices = async (isPullToRefresh = false, customOffset?: number) => {
+        const currentOffset = customOffset !== undefined ? customOffset : (isPullToRefresh ? 0 : offset);
+        if (isPullToRefresh) setOffset(0);
         try {
             await db.initDB();
-            setLoading(true);
+            if (!refreshing) setLoading(true);
 
             // 1. CARGA INSTANTÁNEA (Offline-First por defecto)
             console.log('Cargando facturas desde SQLite...');
@@ -106,7 +131,22 @@ export default function CobranzasScreen() {
                 console.log('Refrescando datos desde Odoo...');
                 try {
                     const user = useAuthStore.getState().user;
-                    const invoiceDomain = getSiatDomain('account.move', user);
+                    const invoiceDomain: any[] = getSiatDomain('account.move', user);
+
+                    if (dateFilter !== 'All') {
+                        const today = new Date();
+                        const pad = (n: number) => n.toString().padStart(2, '0');
+                        const formatStr = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+                        if (dateFilter === 'Today') {
+                            invoiceDomain.push(['invoice_date', '>=', formatStr(today)]);
+                        } else if (dateFilter === '7Days') {
+                            const d = new Date(); d.setDate(d.getDate() - 7);
+                            invoiceDomain.push(['invoice_date', '>=', formatStr(d)]);
+                        } else if (dateFilter === '30Days') {
+                            const d = new Date(); d.setDate(d.getDate() - 30);
+                            invoiceDomain.push(['invoice_date', '>=', formatStr(d)]);
+                        }
+                    }
                     
                     // Combinamos con filtros de estado específicos de esta pantalla
                     const fullDomain = [
@@ -120,8 +160,15 @@ export default function CobranzasScreen() {
                     const result = await callOdoo('account.move', 'search_read', {
                         domain: fullDomain,
                         fields: ['name', 'partner_id', 'invoice_date', 'invoice_date_due', 'amount_total', 'amount_residual', 'invoice_line_ids', 'invoice_user_id', 'company_id'],
-                        limit: 100
+                        limit: limit,
+                        offset: currentOffset,
+                        order: 'id desc'
                     }, true);
+
+                    const count: number = await callOdoo('account.move', 'search_count', {
+                        domain: fullDomain
+                    }, true);
+                    setTotalCount(count);
 
                     if (result && Array.isArray(result)) {
                         // Guardamos lo nuevo en SQLite
@@ -304,7 +351,7 @@ export default function CobranzasScreen() {
 
     const onRefresh = () => {
         setRefreshing(true);
-        fetchInvoices();
+        fetchInvoices(true);
     };
 
     const renderLine = (line: AccountMoveLine) => (
@@ -387,6 +434,7 @@ export default function CobranzasScreen() {
                         <Text style={styles.noLinesText}>Cargando detalle...</Text>
                     )}
 
+                    {!isAuditMode && (
                     <View style={styles.actionContainer}>
                         <TouchableOpacity 
                             style={styles.payButton}
@@ -396,6 +444,7 @@ export default function CobranzasScreen() {
                             <Text style={styles.payButtonText}>Registrar Pago</Text>
                         </TouchableOpacity>
                     </View>
+                    )}
                 </View>
             )}
         </View>
@@ -419,7 +468,7 @@ export default function CobranzasScreen() {
                     <Text style={styles.headerTitle}>Cobranzas</Text>
                     <View style={styles.headerIcons}>
                         {isOffline && <FontAwesome name="flash" size={16} color="#F59E0B" style={{ marginRight: 10 }} />}
-                        <TouchableOpacity onPress={fetchInvoices} disabled={loading}>
+                        <TouchableOpacity onPress={() => fetchInvoices(true)} disabled={loading || isAuditMode} style={{opacity: isAuditMode ? 0.3 : 1}}>
                             <FontAwesome name="refresh" size={20} color="#714B67" />
                         </TouchableOpacity>
                     </View>
@@ -431,10 +480,10 @@ export default function CobranzasScreen() {
             </View>
 
             <View style={styles.searchContainer}>
-                <FontAwesome name="search" size={16} color="#9CA3AF" style={styles.searchIcon} />
+                <FontAwesome name="search" size={20} color="#9CA3AF" />
                 <TextInput
                     style={styles.searchInput}
-                    placeholder="Buscar por cliente o factura..."
+                    placeholder="Buscar facturas..."
                     value={searchQuery}
                     onChangeText={handleSearch}
                 />
@@ -444,6 +493,19 @@ export default function CobranzasScreen() {
                     </TouchableOpacity>
                 )}
             </View>
+
+            <ListFilters
+                limit={limit}
+                setLimit={(v) => { setLimit(v); setOffset(0); }}
+                dateFilter={dateFilter}
+                setDateFilter={(v) => { setDateFilter(v); setOffset(0); }}
+                onApply={() => { setOffset(0); fetchInvoices(false); }}
+                disabled={isOffline || useAuthStore.getState().isAuditMode}
+                offset={offset}
+                totalCount={totalCount}
+                onNextPage={handleNextPage}
+                onPrevPage={handlePrevPage}
+            />
 
             <FlatList
                 data={filteredInvoices}

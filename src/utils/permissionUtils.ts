@@ -80,6 +80,18 @@ export const getSiatDomain = (model: string, user: any, permissions?: SiatPermis
     // Filtro base de Sucursal: ESTRICTO.
     const branchFilter = ["company_id", "in", companyIds];
 
+    // Filtro diario (Solo Hoy)
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayStartStr = today.toISOString().replace('T', ' ').substring(0, 19);
+
+    const todayEnd = new Date();
+    todayEnd.setHours(23, 59, 59, 999);
+    const todayEndStr = todayEnd.toISOString().replace('T', ' ').substring(0, 19);
+
+    const dailyFilter = ["&", ["date_order", ">=", todayStartStr], ["date_order", "<=", todayEndStr]];
+    const dailyDeliveryFilter = ["&", ["scheduled_date", ">=", todayStartStr], ["scheduled_date", "<=", todayEndStr]];
+
     if (perms.is_admin) {
         if (model === 'account.move') {
             return [
@@ -87,6 +99,11 @@ export const getSiatDomain = (model: string, user: any, permissions?: SiatPermis
                 "&", ["move_type", "=", "out_invoice"],
                 "&", ["state", "=", "posted"], ["amount_residual", ">", 0]
             ];
+        } else if (model === 'sale.order') {
+            return ["&", branchFilter, ...dailyFilter.slice(1)];
+        } else if (model === 'stock.picking' || model === 'stock.move') {
+            // we will use the same filter. Odoo stock.picking has date_deadline or scheduled_date
+            return ["&", branchFilter, ...dailyDeliveryFilter.slice(1)];
         }
         return [branchFilter];
     }
@@ -96,6 +113,7 @@ export const getSiatDomain = (model: string, user: any, permissions?: SiatPermis
         case 'sale.order':
             return [
                 "&", branchFilter,
+                "&", ...dailyFilter.slice(1),
                 ["user_id", "=", uid]
             ];
         case 'account.move':
@@ -108,11 +126,15 @@ export const getSiatDomain = (model: string, user: any, permissions?: SiatPermis
         case 'stock.picking':
             return [
                 "&", branchFilter,
+                "&", ...dailyDeliveryFilter.slice(1),
                 "&", ["picking_type_code", "=", "outgoing"], ["user_id", "=", uid]
             ];
         case 'stock.move':
+            // For stock.move in Odoo we use date
+            const dailyMoveFilter = ["&", ["date", ">=", todayStartStr], ["date", "<=", todayEndStr]];
             return [
                 "&", branchFilter,
+                "&", ...dailyMoveFilter.slice(1),
                 "&", ["picking_id.picking_type_code", "=", "outgoing"], ["picking_id.user_id", "=", uid]
             ];
         case 'account.payment':

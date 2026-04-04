@@ -302,15 +302,65 @@ export const runSync = async (onProgress?: (msg: string) => void) => {
         // 5. Utility Data
         const hasOps = effectivePermissions.view_sales || effectivePermissions.view_receivables || effectivePermissions.view_pickings || effectivePermissions.is_admin;
         if (hasOps) {
-            onProgress?.('Sincronizando productos y métodos...');
+            onProgress?.('Sincronizando productos y descuentos...');
             const products = await callOdoo('product.product', 'search_read', {
                 domain: [['sale_ok', '=', true]],
-                fields: ['display_name', 'list_price', 'qty_available'],
+                fields: ['display_name', 'list_price', 'qty_available', 'product_tmpl_id'],
                 limit: 500
             });
-            console.log(`[SYNC] Productos recibidos: ${products?.length}. Primer producto:`, products?.[0] ? JSON.stringify(products[0]) : 'vacío');
+
+            // Obtener items de lista de precios para estos productos
+            let pricelistItems: any[] = [];
+            try {
+                const productIds = products.map((p: any) => p.id);
+                const tmplIds = products.map((p: any) => Array.isArray(p.product_tmpl_id) ? p.product_tmpl_id[0] : p.product_tmpl_id);
+                
+                pricelistItems = await callOdoo('product.pricelist.item', 'search_read', {
+                    domain: ['|', ['product_id', 'in', productIds], ['product_tmpl_id', 'in', tmplIds]],
+                    fields: ['product_id', 'product_tmpl_id', 'compute_price', 'percent_price', 'price_discount', 'min_quantity', 'date_start', 'date_end']
+                });
+            } catch (e) {
+                console.warn('Error al sincronizar listas de precios:', e);
+            }
+
+            // Mapear descuentos a productos
+            const productsWithMaxDiscount = products.map((p: any) => {
+                const items = pricelistItems.filter((i: any) => 
+                    (i.product_id && i.product_id[0] === p.id) || 
+                    (i.product_tmpl_id && i.product_tmpl_id[0] === (Array.isArray(p.product_tmpl_id) ? p.product_tmpl_id[0] : p.product_tmpl_id))
+                );
+                
+                const rules = items.map((item: any) => {
+                    let discount = 0;
+                    if (item.compute_price === 'percentage') {
+                        discount = item.percent_price;
+                    } else if (item.compute_price === 'formula') {
+                        discount = item.price_discount;
+                    }
+                    return {
+                        min_qty: item.min_quantity || 0,
+                        discount: discount,
+                        start: item.date_start || null,
+                        end: item.date_end || null
+                    };
+                });
+
+                // Ordenar reglas por cantidad mínima descendente para facilitar la evaluación
+                rules.sort((a, b) => b.min_qty - a.min_qty);
+                
+                // Mantener max_discount como el descuento más alto posible (sin importar cantidad) para compatibilidad básica
+                const overallMax = rules.length > 0 ? Math.max(...rules.map(r => r.discount)) : 0;
+
+                return {
+                    ...p,
+                    max_discount: overallMax,
+                    discount_rules: JSON.stringify(rules)
+                };
+            });
+
+            console.log(`[SYNC] Productos procesados: ${productsWithMaxDiscount.length}.`);
             await db.clearTable('products');
-            if (products?.length > 0) await db.saveProducts(products);
+            if (productsWithMaxDiscount.length > 0) await db.saveProducts(productsWithMaxDiscount);
 
             const journals = await callOdoo('account.journal', 'search_read', {
                 domain: [['type', 'in', ['bank', 'cash']]],
@@ -422,11 +472,16 @@ export const uploadOfflineChanges = async (onProgress?: (msg: string) => void) =
                 
                 // Get lines for this order
                 const lines = await db.getSaleOrderLines(o.id);
-                const orderLinesOdoo = lines.map((l: any) => [0, 0, {
-                    product_id: l.product_id,
-                    product_uom_qty: l.product_uom_qty,
-                    price_unit: l.price_unit
-                }]);
+                const orderLinesOdoo = lines.map((l: any) => {
+                    // Si el pedido tiene descuento global, ese manda. Si no, el de la línea.
+                    const appliedDiscount = (o.global_discount && o.global_discount > 0) ? o.global_discount : (l.discount || 0);
+                    return [0, 0, {
+                        product_id: l.product_id,
+                        product_uom_qty: l.product_uom_qty,
+                        price_unit: l.price_unit,
+                        discount: appliedDiscount
+                    }];
+                });
 
                 const response = await callOdoo('sale.order', 'create', {
                     vals_list: [{

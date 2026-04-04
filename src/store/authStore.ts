@@ -20,11 +20,13 @@ interface AuthUser {
 interface AuthState {
   isLoggedIn: boolean;
   user: AuthUser | null;
+  isAuditMode: boolean;
   
   // Actions
   login: (userData: AuthUser) => void;
   updateUser: (userData: Partial<AuthUser>) => void;
   logout: () => void;
+  setAuditMode: (mode: boolean) => void;
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -32,6 +34,7 @@ export const useAuthStore = create<AuthState>()(
     (set) => ({
       isLoggedIn: false,
       user: null,
+      isAuditMode: false,
 
       login: (userData) => set({ 
         isLoggedIn: true, 
@@ -44,8 +47,13 @@ export const useAuthStore = create<AuthState>()(
 
       logout: () => set({ 
         isLoggedIn: false, 
-        user: null 
+        user: null,
+        isAuditMode: false
       }),
+
+      setAuditMode: (mode) => set({
+        isAuditMode: mode
+      })
     }),
     {
       name: 'auth-storage',

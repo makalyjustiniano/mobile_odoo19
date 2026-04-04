@@ -25,6 +25,7 @@ import * as db from '../../src/services/dbService';
 import { uploadOfflineChanges, syncPortalMetadata } from '../../src/services/syncService';
 import { getSiatDomain } from '../../src/utils/permissionUtils';
 import { useAuthStore } from '../../src/store/authStore';
+import ListFilters, { DateFilterType } from '../../src/components/ListFilters';
 
 interface SaleOrderLine {
     id: number;
@@ -59,6 +60,9 @@ interface Product {
     id: number;
     display_name: string;
     list_price: number;
+    max_discount?: number;
+    discount_rules?: string;
+    qty_available?: number;
 }
 
 interface NewLine {
@@ -66,6 +70,9 @@ interface NewLine {
     product_name: string;
     quantity: number;
     price: number;
+    discount: number;
+    max_discount: number;
+    discount_rules?: string;
 }
 
 interface Invoice {
@@ -115,11 +122,47 @@ export default function VentasScreen() {
     const [showProductResults, setShowProductResults] = useState(false);
 
     const [quoteLines, setQuoteLines] = useState<NewLine[]>([]);
+    const [globalDiscount, setGlobalDiscount] = useState<string>('0');
     const [shouldConfirm, setShouldConfirm] = useState(false);
     
     // Main Research Search
     const [mainSearchQuery, setMainSearchQuery] = useState('');
     const [filteredResult, setFilteredResult] = useState<SaleOrder[]>([]);
+    const [isSavingSales, setIsSavingSales] = useState(false);
+    
+    // Filters state
+    const [limit, setLimit] = useState<number>(50);
+    const [offset, setOffset] = useState<number>(0);
+    const [totalCount, setTotalCount] = useState<number>(0);
+    const [dateFilter, setDateFilter] = useState<DateFilterType>('Today');
+    const [hasUnsyncedData, setHasUnsyncedData] = useState(false);
+
+    const getBestDiscount = (rulesStr: string | undefined, qty: number): number => {
+        if (!rulesStr || rulesStr === '[]') return 0;
+        try {
+            const rules = JSON.parse(rulesStr);
+            if (!Array.isArray(rules)) return 0;
+            const now = new Date();
+            // Filtrar por reglas vigentes y cantidad suficiente
+            const validRules = rules.filter((r: any) => {
+                const start = r.start ? new Date(r.start) : null;
+                const end = r.end ? new Date(r.end) : null;
+                const isStarted = !start || now >= start;
+                const isNotEnded = !end || now <= end;
+                return isStarted && isNotEnded && qty >= r.min_qty;
+            });
+            
+            if (validRules.length === 0) return 0;
+            
+            // SORTEAR DESCENDENTE por min_qty para agarrar siempre el nivel más alto alcanzado
+            validRules.sort((a, b) => b.min_qty - a.min_qty);
+            
+            return validRules[0].discount;
+        } catch (e) {
+            console.error('Error parsing rules:', e);
+            return 0;
+        }
+    };
 
     const handleMainSearch = (text: string) => {
         setMainSearchQuery(text);
@@ -142,7 +185,25 @@ export default function VentasScreen() {
         fetchData();
     }, [isOffline]);
 
-    const fetchData = async () => {
+    const handleNextPage = () => {
+        if (offset + limit < totalCount) {
+            const newOffset = offset + limit;
+            setOffset(newOffset);
+            fetchData(false, newOffset);
+        }
+    };
+
+    const handlePrevPage = () => {
+        const newOffset = Math.max(0, offset - limit);
+        if (newOffset !== offset) {
+            setOffset(newOffset);
+            fetchData(false, newOffset);
+        }
+    };
+
+    const fetchData = async (isPullToRefresh = false, customOffset?: number) => {
+        const currentOffset = customOffset !== undefined ? customOffset : (isPullToRefresh ? 0 : offset);
+        if (isPullToRefresh) setOffset(0);
         try {
             await db.initDB();
             if (!refreshing) setLoading(true);
@@ -151,6 +212,10 @@ export default function VentasScreen() {
             console.log('Cargando ventas desde SQLite...');
             const localOrders = await db.getSaleOrders();
             setResult(localOrders as any);
+            
+            const unsynced = await db.getUnsyncedCount();
+            setHasUnsyncedData(unsynced > 0);
+            
             if (localOrders && localOrders.length > 0) setLoading(false);
 
             // 2. ACTUALIZACIÓN EN SEGUNDO PLANO (Si online)
@@ -161,12 +226,34 @@ export default function VentasScreen() {
                     await syncPortalMetadata();
 
                     const user = useAuthStore.getState().user;
-                    const saleDomain = getSiatDomain('sale.order', user);
+                    const saleDomain: any[] = getSiatDomain('sale.order', user);
                     
+                    if (dateFilter !== 'All') {
+                        const today = new Date();
+                        const pad = (n: number) => n.toString().padStart(2, '0');
+                        const formatStr = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+                        if (dateFilter === 'Today') {
+                            saleDomain.push(['date_order', '>=', `${formatStr(today)} 00:00:00`]);
+                        } else if (dateFilter === '7Days') {
+                            const d = new Date(); d.setDate(d.getDate() - 7);
+                            saleDomain.push(['date_order', '>=', `${formatStr(d)} 00:00:00`]);
+                        } else if (dateFilter === '30Days') {
+                            const d = new Date(); d.setDate(d.getDate() - 30);
+                            saleDomain.push(['date_order', '>=', `${formatStr(d)} 00:00:00`]);
+                        }
+                    }
+
+                    const count: number = await callOdoo('sale.order', 'search_count', {
+                        domain: saleDomain
+                    }, true);
+                    setTotalCount(count);
+
                     const orders: SaleOrder[] = await callOdoo('sale.order', 'search_read', {
                         domain: saleDomain,
-                        fields: ["name", "display_name", "partner_id", "date_order", "state", "amount_total", "order_line", "invoice_ids", "company_id", "user_id"],
-                        limit: 50
+                        fields: ["name", "display_name", "partner_id", "date_order", "state", "amount_total", "order_line", "invoice_ids", "company_id", "user_id", "client_order_ref"],
+                        limit: limit,
+                        offset: currentOffset,
+                        order: 'id desc'
                     }, true);
 
                     if (orders && Array.isArray(orders)) {
@@ -264,11 +351,17 @@ export default function VentasScreen() {
                 
                 const productArray = Array.isArray(results) ? results : (results?.result || []);
                 if (productArray.length > 0) {
-                    const normalizedProducts = productArray.map((p: any) => ({
-                        ...p,
-                        qty_available: p.qty_available ?? 0
-                    }));
-                    setProducts(normalizedProducts);
+                    const enrichedResults = productArray.map((onlineP: any) => {
+                        // Enriquecer con datos locales (reglas de descuento) que no están en Odoo
+                        const localP = localResults.find(lp => lp.id === onlineP.id);
+                        return {
+                            ...onlineP,
+                            max_discount: localP?.max_discount || 0,
+                            discount_rules: localP?.discount_rules || "[]",
+                            qty_available: onlineP.qty_available ?? localP?.qty_available ?? 0
+                        };
+                    });
+                    setProducts(enrichedResults);
                 }
             } catch (error) {
                 console.log('Online product search failed, using local SQLite.');
@@ -279,16 +372,20 @@ export default function VentasScreen() {
     const addProductToQuote = (product: Product) => {
         const existing = quoteLines.find(l => l.product_id === product.id);
         if (existing) {
-            setQuoteLines(quoteLines.map(l =>
-                l.product_id === product.id ? { ...l, quantity: l.quantity + 1 } : l
-            ));
+            updateQuantity(product.id, 1);
         } else {
-            setQuoteLines([...quoteLines, {
+            const bestDisc = getBestDiscount(product.discount_rules, 1);
+            
+            const newLine: NewLine = {
                 product_id: product.id,
                 product_name: product.display_name,
                 quantity: 1,
-                price: product.list_price
-            }]);
+                price: product.list_price,
+                discount: bestDisc,
+                max_discount: Math.max(bestDisc, product.max_discount || 0),
+                discount_rules: product.discount_rules
+            };
+            setQuoteLines([...quoteLines, newLine]);
         }
         setProductSearch('');
         setShowProductResults(false);
@@ -302,117 +399,151 @@ export default function VentasScreen() {
         setQuoteLines(quoteLines.map(l => {
             if (l.product_id === productId) {
                 const newQty = Math.max(1, l.quantity + delta);
-                return { ...l, quantity: newQty };
+                const currentRuleDisc = getBestDiscount(l.discount_rules, l.quantity);
+                const newRuleDisc = getBestDiscount(l.discount_rules, newQty);
+                
+                // REGLA: 
+                // 1. Si la nueva cantidad activa una regla (newRuleDisc > 0), se aplica.
+                // 2. Si la nueva cantidad NO activa regla (newRuleDisc == 0) PERO la anterior SÍ (currentRuleDisc > 0), 
+                //    significa que bajamos del umbral: reseteamos a 0.
+                // 3. De lo contrario, mantenemos el descuento manual previo (l.discount).
+                let finalDiscount = l.discount;
+                if (newRuleDisc > 0) {
+                    finalDiscount = newRuleDisc;
+                } else if (currentRuleDisc > 0 && newRuleDisc === 0) {
+                    finalDiscount = 0;
+                }
+                
+                return { 
+                    ...l, 
+                    quantity: newQty, 
+                    discount: finalDiscount,
+                    max_discount: Math.max(newRuleDisc, l.max_discount || 0)
+                };
             }
             return l;
         }));
     };
 
     const updatePrice = (productId: number, newPrice: string) => {
-        const val = parseFloat(newPrice) || 0;
-        setQuoteLines(quoteLines.map(l => 
-            l.product_id === productId ? { ...l, price: val } : l
-        ));
+        // Bloqueado según requerimiento: El precio base es de lectura únicamente.
+        // No se realiza ninguna acción si se intenta editar.
     };
 
-    const saveQuotation = async () => {
+    const updateLineDiscount = (productId: number, discountStr: string) => {
+        const val = parseFloat(discountStr) || 0;
+        setQuoteLines(quoteLines.map(l => {
+            if (l.product_id === productId) {
+                if (val > l.max_discount) {
+                    Alert.alert('Límite de Descuento', `El descuento máximo permitido para este producto es ${l.max_discount}%`);
+                    return l;
+                }
+                return { ...l, discount: val };
+            }
+            return l;
+        }));
+    };
+
+    const saveQuotation = async (shouldConfirm = false) => {
         if (!selectedPartner) {
             Alert.alert('Error', 'Seleccione un cliente');
             return;
         }
         if (quoteLines.length === 0) {
-            Alert.alert('Error', 'Agregue al menos un producto');
+            Alert.alert('Error', 'La cotización no tiene productos');
             return;
         }
 
         try {
+            setIsSavingSales(true);
             setLoading(true);
+
             const user = useAuthStore.getState().user;
-            const partnerDisplayName = selectedPartner.display_name;
-            const amountTotal = quoteLines.reduce((acc, l) => acc + (l.price * l.quantity), 0);
-            
+            const gDisc = parseFloat(globalDiscount) || 0;
+            const amountTotal = quoteLines.reduce((acc, l) => acc + (l.price * l.quantity * (1 - (l.discount || 0) / 100)), 0) * (1 - gDisc / 100);
+
             const commonVals = {
                 partner_id: selectedPartner.id,
-                date_order: new Date().toISOString().replace('T', ' ').substring(0, 19),
+                partner_name: selectedPartner.display_name,
+                date_order: new Date().toISOString().slice(0, 19).replace('T', ' '),
                 amount_total: amountTotal,
                 user_id: user?.uid || null,
                 user_name: user?.name || '',
-                company_id: user?.company_id || 1
+                company_id: user?.company_id || 1,
+                global_discount: gDisc,
+                state: 'draft'
             };
 
-            // 1. INTENTO DE OPERACIÓN EN TIEMPO REAL (Si online)
-            if (!isOffline) {
-                console.log('[RealTime] Detectado modo Online. Intentando crear en Odoo...');
-                try {
-                    const orderLinesOdoo = quoteLines.map(line => [0, 0, {
-                        product_id: line.product_id,
-                        product_uom_qty: line.quantity,
-                        price_unit: line.price,
-                    }]);
-
-                    const createRes: any = await callOdoo('sale.order', 'create', {
-                        vals_list: [{
-                            partner_id: commonVals.partner_id,
-                            user_id: commonVals.user_id,
-                            company_id: user?.company_id || 1, // Enforce branch context
-                            order_line: orderLinesOdoo,
-                        }]
-                    });
-
-                    const newOdooId = Array.isArray(createRes) ? (createRes[0].id || createRes[0]) : (createRes.id || createRes);
-                    
-                    if (newOdooId) {
-                        // Guardar en SQLite ya marcado como sincronizado
-                        await db.createSaleOrderLocal({
-                            ...commonVals,
-                            id: newOdooId,
-                            partner_name: partnerDisplayName,
-                            sync_status: 'synced'
-                        }, quoteLines);
-
-                        // Opcional: Confirmar automáticamente si el botón lo indica
-                        if (shouldConfirm) {
-                            console.log('[RealTime] Confirmando pedido automáticamente...');
-                            await callOdoo('sale.order', 'action_confirm', { ids: [newOdooId] });
-                        }
-
-                        Alert.alert('Éxito (RealTime)', `Venta de ${partnerDisplayName} generada en Odoo correctamente.`);
-                        setModalVisible(false);
-                        setSelectedPartner(null);
-                        setQuoteLines([]);
-                        fetchData();
-                        return; // Salto exitoso
-                    }
-                } catch (onlineErr: any) {
-                    console.warn('[RealTime] Falló creación directa, reintentando via cola offline:', onlineErr.message);
-                }
-            }
-
-            // 2. FALLBACK: GUARDADO LOCAL (Offline o fallo de red)
-            console.log('[HybridSync] Guardando localmente para posterior sincronización...');
-            await db.createSaleOrderLocal({
-                ...commonVals,
-                partner_name: partnerDisplayName,
-                sync_status: 'new'
-            }, quoteLines);
+            // 1. GUARDADO LOCAL INMEDIATO (El usuario no espera)
+            const tempOrderId = -(Date.now());
+            const clientOrderRef = `APP-${Math.abs(tempOrderId)}-${Math.floor(Math.random() * 1000)}`;
+            await db.createSaleOrderLocal({ ...commonVals, id: tempOrderId, name: clientOrderRef, sync_status: 'new' }, quoteLines);
             
-            setModalVisible(false);
-            setSelectedPartner(null);
-            setQuoteLines([]);
-            
-            if (!isOffline) {
-                // Intento de subida en background
-                uploadOfflineChanges().catch(e => console.log('Background upload delayed:', e.message));
-                Alert.alert('Información', 'Venta guardada localmente. Se subirá a Odoo en unos segundos.');
-            } else {
-                Alert.alert('Modo Offline', `Venta de ${partnerDisplayName} guardada localmente.`);
-            }
+            // FEEDBACK INMEDIATO
             fetchData();
-        } catch (error: any) {
-            console.error('Error in saveQuotation:', error);
-            Alert.alert('Error', `No se pudo procesar la venta: ${error.message}`);
-        } finally {
+            setModalVisible(false);
+            setQuoteLines([]);
+            setSelectedPartner(null);
+            setPartnerSearch('');
+            setGlobalDiscount('0');
             setLoading(false);
+            setIsSavingSales(false);
+
+            // 2. SINCRONIZACIÓN EN SEGUNDO PLANO (No bloquea la UI)
+            if (!isOffline) {
+                // Definimos la tarea de fondo
+                const backgroundSync = async () => {
+                    try {
+                        const sqlite = await db.getDb();
+                        await sqlite.runAsync('UPDATE sale_orders SET sync_status = "syncing" WHERE id = ?', [tempOrderId]);
+
+                        const orderLinesOdoo = quoteLines.map(line => [0, 0, {
+                            product_id: line.product_id,
+                            product_uom_qty: line.quantity,
+                            price_unit: line.price,
+                            discount: line.discount || 0,
+                        }]);
+
+                        const response: any = await callOdoo('sale.order', 'create', {
+                            vals_list: [{
+                                partner_id: commonVals.partner_id,
+                                user_id: commonVals.user_id,
+                                company_id: commonVals.company_id,
+                                client_order_ref: clientOrderRef,
+                                order_line: orderLinesOdoo,
+                            }]
+                        }, true, undefined, 10000); // 10s timeout
+
+                        const newOdooId = (Array.isArray(response) && response.length > 0) 
+                            ? (response[0].id || response[0]) 
+                            : (response && typeof response === 'object' ? response.id || response.result : response);
+
+                        if (newOdooId && typeof newOdooId === 'number') {
+                            if (shouldConfirm) {
+                                await callOdoo('sale.order', 'action_confirm', { ids: [newOdooId] }, true, undefined, 10000);
+                            }
+                            await db.swapLocalIdWithOdooId(tempOrderId, newOdooId, `S${newOdooId.toString().padStart(5, '0')}`);
+                            console.log('[BackgroundSync] Pedido sincronizado:', newOdooId);
+                            fetchData(); // Actualizamos la lista para que el usuario vea el checkmark de sincronizado
+                        } else {
+                            throw new Error('Servidor retornó respuesta inválida');
+                        }
+                    } catch (e: any) {
+                        console.warn('[BackgroundSync] Falló, quedará para el SyncService:', e.message);
+                        const sqlite = await db.getDb();
+                        await sqlite.runAsync('UPDATE sale_orders SET sync_status = "new" WHERE id = ?', [tempOrderId]);
+                    }
+                };
+
+                // Lanzar sin await
+                backgroundSync();
+            }
+
+        } catch (error: any) {
+            console.error('[ERROR] Fallo al guardar venta local:', error);
+            Alert.alert('Error', 'No se pudo guardar la venta localmente.');
+            setLoading(false);
+            setIsSavingSales(false);
         }
     };
 
@@ -715,24 +846,29 @@ export default function VentasScreen() {
                     </View>
                     
                     <View style={styles.actionRow}>
-                        {( (item.state === 'draft' || item.state === 'sent') && permissions?.confirm_sale ) && (
-                            <TouchableOpacity
-                                style={styles.confirmInlineButton}
-                                onPress={() => confirmExistingOrder(item.id)}
-                            >
-                                <FontAwesome name="check-circle" size={14} color="#fff" />
-                                <Text style={styles.confirmInlineText}>CONFIRMAR</Text>
-                            </TouchableOpacity>
-                        )}
+                        {/* Funciones deshabilitadas en modo auditoría */}
+                        {!(useAuthStore.getState().isAuditMode) && (
+                            <>
+                                {( (item.state === 'draft' || item.state === 'sent') && permissions?.confirm_sale ) && (
+                                    <TouchableOpacity
+                                        style={styles.confirmInlineButton}
+                                        onPress={() => confirmExistingOrder(item.id)}
+                                    >
+                                        <FontAwesome name="check-circle" size={14} color="#fff" />
+                                        <Text style={styles.confirmInlineText}>CONFIRMAR</Text>
+                                    </TouchableOpacity>
+                                )}
 
-                        {item.state === 'sale' && !item.invoice_id && permissions?.confirm_sale && (
-                            <TouchableOpacity
-                                style={styles.invoiceButton}
-                                onPress={() => handleCreateInvoice(item.id)}
-                            >
-                                <FontAwesome name="file-text" size={14} color="#fff" />
-                                <Text style={styles.actionText}>FACTURAR</Text>
-                            </TouchableOpacity>
+                                {item.state === 'sale' && !item.invoice_id && permissions?.confirm_sale && (
+                                    <TouchableOpacity
+                                        style={styles.invoiceButton}
+                                        onPress={() => handleCreateInvoice(item.id)}
+                                    >
+                                        <FontAwesome name="file-text" size={14} color="#fff" />
+                                        <Text style={styles.actionText}>FACTURAR</Text>
+                                    </TouchableOpacity>
+                                )}
+                            </>
                         )}
 
                         {item.invoice_id && permissions?.view_invoices && (
@@ -755,12 +891,14 @@ export default function VentasScreen() {
         </View>
     );
 
+    const isAuditMode = useAuthStore.getState().isAuditMode;
+
     return (
         <View style={styles.container}>
             <View style={styles.header}>
                 <Text style={styles.headerTitle}>Ventas / Sectores</Text>
                 <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                    {permissions?.create_sale && (
+                    {permissions?.create_sale && !isAuditMode && (
                         <TouchableOpacity 
                             style={[styles.newButton, { marginRight: 15 }]} 
                             onPress={() => setModalVisible(true)}
@@ -769,17 +907,17 @@ export default function VentasScreen() {
                             <Text style={styles.newButtonText}>NUEVA</Text>
                         </TouchableOpacity>
                     )}
-                    <TouchableOpacity onPress={fetchData} disabled={loading}>
+                    <TouchableOpacity onPress={fetchData} disabled={loading || isAuditMode} style={{opacity: isAuditMode ? 0.3 : 1}}>
                         <FontAwesome name="refresh" size={20} color="#714B67" />
                     </TouchableOpacity>
                 </View>
             </View>
 
             <View style={styles.searchContainer}>
-                <FontAwesome name="search" size={16} color="#9CA3AF" style={styles.searchIcon} />
+                <FontAwesome name="search" size={20} color="#9CA3AF" style={styles.searchIcon} />
                 <TextInput
                     style={styles.searchInput}
-                    placeholder="Buscar por cliente o pedido..."
+                    placeholder="Buscar ventas..."
                     value={mainSearchQuery}
                     onChangeText={handleMainSearch}
                 />
@@ -789,6 +927,19 @@ export default function VentasScreen() {
                     </TouchableOpacity>
                 )}
             </View>
+
+            <ListFilters
+                limit={limit}
+                setLimit={(v) => { setLimit(v); setOffset(0); }}
+                dateFilter={dateFilter}
+                setDateFilter={(v) => { setDateFilter(v); setOffset(0); }}
+                onApply={() => { setOffset(0); fetchData(true); }}
+                disabled={isOffline || useAuthStore.getState().isAuditMode}
+                offset={offset}
+                totalCount={totalCount}
+                onNextPage={handleNextPage}
+                onPrevPage={handlePrevPage}
+            />
 
             <FlatList
                 data={filteredResult}
@@ -921,10 +1072,23 @@ export default function VentasScreen() {
                                             <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 5 }}>
                                                 <Text style={{ fontSize: 13, color: '#6B7280', marginRight: 5 }}>Bs.</Text>
                                                 <TextInput
-                                                    style={styles.priceInput}
+                                                    style={[styles.priceInput, { backgroundColor: '#F3F4F6', color: '#9CA3AF' }]}
                                                     keyboardType="numeric"
                                                     value={line.price.toString()}
-                                                    onChangeText={(txt) => updatePrice(line.product_id, txt)}
+                                                    editable={false}
+                                                />
+                                            </View>
+                                            <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 5 }}>
+                                                <Text style={{ fontSize: 13, color: '#00A09D', marginRight: 5 }}>Desc. Linea %</Text>
+                                                <TextInput
+                                                    style={[
+                                                        styles.priceInput, 
+                                                        parseFloat(globalDiscount) > 0 && { backgroundColor: '#F3F4F6', color: '#9CA3AF' }
+                                                    ]}
+                                                    keyboardType="numeric"
+                                                    value={line.discount.toString()}
+                                                    onChangeText={(txt) => updateLineDiscount(line.product_id, txt)}
+                                                    editable={parseFloat(globalDiscount) === 0}
                                                 />
                                             </View>
                                         </View>
@@ -960,17 +1124,56 @@ export default function VentasScreen() {
                         </ScrollView>
 
                         <View style={styles.modalFooter}>
+                            <View style={{ marginBottom: 10, borderBottomWidth: 1, borderBottomColor: '#F3F4F6', paddingBottom: 10 }}>
+                                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+                                    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                                        <FontAwesome name="globe" size={16} color="#714B67" style={{ marginRight: 8 }} />
+                                        <Text style={[styles.inputLabel, { marginTop: 0 }]}>Descuento Global %</Text>
+                                    </View>
+                                    <TextInput
+                                        style={[
+                                            styles.priceInput, 
+                                            { width: 80 },
+                                            quoteLines.some(l => l.discount > 0) && { backgroundColor: '#F3F4F6', color: '#9CA3AF' }
+                                        ]}
+                                        keyboardType="numeric"
+                                        value={globalDiscount}
+                                        onChangeText={setGlobalDiscount}
+                                        editable={!quoteLines.some(l => l.discount > 0)}
+                                    />
+                                </View>
+                                {quoteLines.some(l => l.discount > 0) && (
+                                    <Text style={{ fontSize: 10, color: '#EF4444', textAlign: 'right', marginTop: 2 }}>
+                                        * Deshabilitado: Ya hay descuentos por línea.
+                                    </Text>
+                                )}
+                            </View>
+
                             <Text style={styles.modalTotal}>
-                                Total: Bs. {quoteLines.reduce((acc, l) => acc + (l.price * l.quantity), 0).toFixed(2)}
+                                Total: Bs. {(
+                                    quoteLines.reduce((acc, l) => acc + (l.price * l.quantity * (1 - l.discount / 100)), 0) * 
+                                    (1 - (parseFloat(globalDiscount) || 0) / 100)
+                                ).toFixed(2)}
                             </Text>
                             <TouchableOpacity
-                                style={[styles.saveButton, { backgroundColor: shouldConfirm ? '#22C55E' : '#00A09D', opacity: (selectedPartner && quoteLines.length > 0) ? 1 : 0.5 }]}
+                                style={[
+                                    styles.saveButton, 
+                                    { backgroundColor: shouldConfirm ? '#22C55E' : '#00A09D' },
+                                    (!selectedPartner || quoteLines.length === 0 || isSavingSales) && { opacity: 0.5 }
+                                ]}
                                 onPress={saveQuotation}
-                                disabled={!selectedPartner || quoteLines.length === 0}
+                                disabled={!selectedPartner || quoteLines.length === 0 || isSavingSales}
                             >
-                                <Text style={styles.saveButtonText}>
-                                    {shouldConfirm ? 'CONFIRMAR Y CREAR ORDEN' : 'GUARDAR COMO COTIZACION'}
-                                </Text>
+                                {isSavingSales ? (
+                                    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                                        <ActivityIndicator color="#fff" size="small" style={{ marginRight: 10 }} />
+                                        <Text style={styles.saveButtonText}>PROCESANDO...</Text>
+                                    </View>
+                                ) : (
+                                    <Text style={styles.saveButtonText}>
+                                        {shouldConfirm ? 'CONFIRMAR Y CREAR ORDEN' : 'GUARDAR COMO COTIZACION'}
+                                    </Text>
+                                )}
                             </TouchableOpacity>
                         </View>
                     </View>

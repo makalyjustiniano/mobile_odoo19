@@ -42,7 +42,8 @@ export const callOdoo = async (
   method: string,
   kwargs: OdooKwargs = {},
   silent: boolean = false,
-  connectionOverride?: OdooConnection
+  connectionOverride?: OdooConnection,
+  timeoutMs: number = 30000 // Default 30s
 ) => {
   const connection = connectionOverride || resolveConnection();
   const url = buildJson2Url(connection.url, model, method);
@@ -50,6 +51,9 @@ export const callOdoo = async (
   if (!connection.url) {
     throw new Error('No se ha definido la URL de Odoo en el perfil activo.');
   }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   const headers: any = {
     'Content-Type': 'application/json',
@@ -68,7 +72,10 @@ export const callOdoo = async (
       method: 'POST',
       headers: headers,
       body: JSON.stringify(kwargs),
+      signal: controller.signal,
     });
+    
+    clearTimeout(timeoutId);
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -85,6 +92,12 @@ export const callOdoo = async (
     }
     return data;
   } catch (error: any) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+      const msg = `Timeout: La respuesta de Odoo tardó más de ${timeoutMs/1000}s. El servidor podría estar procesando, pero la app liberará el control.`;
+      if (!silent) console.error(msg);
+      throw new Error(msg);
+    }
     if (!silent) {
       console.error(`Error en callOdoo [${model}.${method}]:`, error.message);
     }

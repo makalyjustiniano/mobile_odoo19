@@ -5,24 +5,28 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  Image,
   KeyboardAvoidingView,
   Platform,
   ScrollView,
   Alert,
   ActivityIndicator,
   Switch,
+  Modal,
+  FlatList
 } from 'react-native';
 import { FontAwesome } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
-import { loginSiat, testConnection, fetchPortalMetadata } from '../src/api/odooClient';
+import { loginSiat, fetchPortalMetadata } from '../src/api/odooClient';
 import { useAuthStore } from '../src/store/authStore';
 import { useConfigStore } from '../src/store/configStore';
 import { runSync } from '../src/services/syncService';
+import { listBackups, loadBackupDatabase } from '../src/services/dbService';
 
 export default function LoginScreen() {
   const router = useRouter();
   const login = useAuthStore((state) => state.login);
+  const setAuditMode = useAuthStore((state) => state.setAuditMode);
+  
   const getActiveProfile = useConfigStore((state) => state.getActiveProfile);
   const activeProfileId = useConfigStore((state) => state.activeProfileId);
   const setProfileField = useConfigStore((state) => state.setProfileField);
@@ -34,11 +38,15 @@ export default function LoginScreen() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
-  const [showApiKey, setShowApiKey] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncMessage, setSyncMessage] = useState('');
   const [isAdvanced, setIsAdvanced] = useState(false);
+  
+  // Backup Modal State
+  const [showBackupModal, setShowBackupModal] = useState(false);
+  const [backups, setBackups] = useState<string[]>([]);
+  const [loadingBackups, setLoadingBackups] = useState(false);
 
   // Sync state if active profile changes
   useEffect(() => {
@@ -51,6 +59,7 @@ export default function LoginScreen() {
 
   const handleLogin = async () => {
     setLoading(true);
+    setAuditMode(false); // Ensure standard flow
     try {
       console.log('Iniciando autenticación SIAT para:', username);
 
@@ -122,6 +131,46 @@ export default function LoginScreen() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleOpenAudit = async () => {
+    setLoadingBackups(true);
+    setShowBackupModal(true);
+    const files = await listBackups();
+    setBackups(files);
+    setLoadingBackups(false);
+  };
+
+  const handleLoadBackup = async (fileName: string) => {
+    Alert.alert(
+      "Modo Auditoría",
+      `¿Deseas cargar "${fileName.replace('odoo_mobile_backup_', '').replace('.db', '')}" para auditar? La aplicación no sincronizará cambios.`,
+      [
+        { text: "Cancelar", style: "cancel" },
+        { text: "Cargar", onPress: async () => {
+            setShowBackupModal(false);
+            setLoading(true);
+            const success = await loadBackupDatabase(fileName);
+            if (success) {
+               // Pseudo-Login for Audit
+               setAuditMode(true);
+               login({
+                  url: 'offline',
+                  apiKey: 'audit',
+                  database: 'audit',
+                  username: 'Auditor',
+                  name: 'Auditor Offline',
+                  uid: 1,
+                  permissions: null
+               });
+               router.replace('/(tabs)/home');
+            } else {
+               Alert.alert('Error', 'No se pudo cargar la base de datos seleccionada.');
+            }
+            setLoading(false);
+        }}
+      ]
+    );
   };
 
   return (
@@ -223,6 +272,14 @@ export default function LoginScreen() {
             )}
           </TouchableOpacity>
 
+          <TouchableOpacity
+            style={styles.auditButton}
+            onPress={handleOpenAudit}
+            disabled={loading}
+          >
+            <FontAwesome name="database" size={16} color="#D1D5DB" style={{marginRight: 8}} />
+            <Text style={styles.auditButtonText}>Modo Auditoría (Respaldos)</Text>
+          </TouchableOpacity>
 
           {syncing && (
             <View style={styles.syncOverlay}>
@@ -233,6 +290,41 @@ export default function LoginScreen() {
 
         </View>
       </ScrollView>
+
+      {/* MODAL DE BACKUPS */}
+      <Modal visible={showBackupModal} animationType="slide" transparent={true}>
+         <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+               <View style={styles.modalHeader}>
+                 <Text style={styles.modalTitle}>Cargar Base de Datos Alterna</Text>
+                 <TouchableOpacity onPress={() => setShowBackupModal(false)}>
+                    <FontAwesome name="close" size={24} color="#374151" />
+                 </TouchableOpacity>
+               </View>
+               
+               {loadingBackups ? (
+                 <ActivityIndicator size="large" color="#00A09D" style={{marginTop: 50}}/>
+               ) : (
+                 <FlatList 
+                    data={backups}
+                    keyExtractor={item => item}
+                    contentContainerStyle={{paddingBottom: 20}}
+                    ListEmptyComponent={<Text style={{textAlign: 'center', marginTop: 30, color: '#6B7280'}}>No se encontraron respaldos locaux.</Text>}
+                    renderItem={({item}) => (
+                        <TouchableOpacity style={styles.backupItem} onPress={() => handleLoadBackup(item)}>
+                            <FontAwesome name="file-text-o" size={20} color="#00A09D" style={{marginRight: 10}}/>
+                            <View style={{flex: 1}}>
+                               <Text style={styles.backupItemName}>{item.replace('odoo_mobile_backup_', '').replace('.db', '')}</Text>
+                               <Text style={{fontSize: 12, color: '#9CA3AF'}}>Modo Solo Lectura</Text>
+                            </View>
+                            <FontAwesome name="chevron-right" size={14} color="#9CA3AF"/>
+                        </TouchableOpacity>
+                    )}
+                 />
+               )}
+            </View>
+         </View>
+      </Modal>
     </KeyboardAvoidingView>
   );
 }
@@ -302,14 +394,17 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: 'bold',
   },
-  createAccountLink: {
-    marginTop: 30,
+  auditButton: {
+    marginTop: 20,
+    flexDirection: 'row',
+    justifyContent: 'center',
     alignItems: 'center',
+    paddingVertical: 10,
   },
-  createAccountText: {
+  auditButtonText: {
     color: '#D1D5DB',
     fontSize: 14,
-    textDecorationLine: 'none',
+    textDecorationLine: 'underline',
   },
   syncOverlay: {
     marginTop: 20,
@@ -333,6 +428,42 @@ const styles = StyleSheet.create({
   advancedLabel: {
     color: '#fff',
     fontSize: 14,
+    fontWeight: '500',
+  },
+  modalOverlay: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(0,0,0,0.5)',
+  },
+  modalContent: {
+    backgroundColor: '#fff',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    height: '60%',
+    padding: 20,
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#1F2937',
+  },
+  backupItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 15,
+    marginBottom: 10,
+    backgroundColor: '#F3F4F6',
+    borderRadius: 8,
+  },
+  backupItemName: {
+    fontSize: 16,
+    color: '#1F2937',
     fontWeight: '500',
   }
 });

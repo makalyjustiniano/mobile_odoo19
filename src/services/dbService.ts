@@ -63,6 +63,19 @@ export const initDB = async () => {
                 console.log('Añadiendo columna user_name a stock_moves...');
                 await db.runAsync('ALTER TABLE stock_moves ADD COLUMN user_name TEXT');
             }
+
+            // Migración para productos (Descuentos dinámicos)
+            const productInfo: any[] = await db.getAllAsync('PRAGMA table_info(products)');
+            if (productInfo.length > 0) {
+                if (!productInfo.some(col => col.name === 'max_discount')) {
+                    console.log('Añadiendo columna max_discount a productos...');
+                    await db.runAsync('ALTER TABLE products ADD COLUMN max_discount REAL DEFAULT 0');
+                }
+                if (!productInfo.some(col => col.name === 'discount_rules')) {
+                    console.log('Añadiendo columna discount_rules a productos...');
+                    await db.runAsync('ALTER TABLE products ADD COLUMN discount_rules TEXT DEFAULT "[]"');
+                }
+            }
         } catch (e) {
             console.warn('Check de esquema fallido:', e);
         }
@@ -116,6 +129,7 @@ export const initDB = async () => {
             company_id INTEGER,
             user_id INTEGER,
             user_name TEXT,
+            global_discount REAL DEFAULT 0,
             sync_status TEXT DEFAULT 'synced',
             is_local INTEGER DEFAULT 0
         )`);
@@ -127,6 +141,7 @@ export const initDB = async () => {
             product_name TEXT,
             product_uom_qty REAL,
             price_unit REAL,
+            discount REAL DEFAULT 0,
             price_subtotal REAL,
             sync_status TEXT DEFAULT 'synced',
             is_local INTEGER DEFAULT 0,
@@ -211,6 +226,8 @@ export const initDB = async () => {
             id INTEGER PRIMARY KEY,
             display_name TEXT,
             list_price REAL,
+            max_discount REAL DEFAULT 0,
+            discount_rules TEXT DEFAULT '[]',
             qty_available REAL DEFAULT 0,
             sync_status TEXT DEFAULT 'synced',
             is_local INTEGER DEFAULT 0
@@ -267,6 +284,10 @@ export const initDB = async () => {
         for (const table of tablesToMigrate) {
             await addColumnIfMissing(table, 'sync_status', "TEXT DEFAULT 'synced'");
             await addColumnIfMissing(table, 'is_local', "INTEGER DEFAULT 0");
+
+            if (table === 'sale_order_lines') {
+                await addColumnIfMissing(table, 'discount', "REAL DEFAULT 0");
+            }
             
             if (['partners', 'sale_orders', 'account_moves', 'stock_moves', 'account_payments'].includes(table)) {
                 await addColumnIfMissing(table, 'company_id', "INTEGER");
@@ -279,12 +300,14 @@ export const initDB = async () => {
 
             if (table === 'products') {
                 await addColumnIfMissing(table, 'qty_available', "REAL DEFAULT 0");
+                await addColumnIfMissing(table, 'max_discount', "REAL DEFAULT 0");
             }
 
             if (table === 'sale_orders' || table === 'stock_moves') {
                 await addColumnIfMissing(table, 'partner_id', "INTEGER");
                 if (table === 'sale_orders') {
                     await addColumnIfMissing(table, 'invoice_id', "INTEGER");
+                    await addColumnIfMissing(table, 'global_discount', "REAL DEFAULT 0");
                 }
             }
             if (table === 'account_moves') {
@@ -379,31 +402,58 @@ export const createSaleOrderLocal = async (order: any, lines: any[]) => {
     console.log('[DEBUG] createSaleOrderLocal called with:', JSON.stringify(order), lines.length, 'lines');
     const db = await getDb();
     
-    // Si ya viene con ID real (RealTime), lo usamos. Si no, generamos uno local negativo.
+    // Si ya viene con ID real (RealTime), lo usamos. Si no, generamos uno local basado en milisegundos para evitar colisiones.
     const isRealTime = order.id && order.id > 0;
-    const orderId = isRealTime ? order.id : -Math.floor(Date.now() / 1000);
+    const orderId = isRealTime ? order.id : -(Date.now());
     const syncStatus = order.sync_status || 'new';
     const isLocal = syncStatus === 'synced' ? 0 : 1;
     
     try {
-        console.log('[DEBUG] Inserting sale_order with ID:', orderId, 'Status:', syncStatus);
-        await db.runAsync(
-            `INSERT INTO sale_orders (id, name, partner_name, partner_id, date_order, state, amount_total, sync_status, is_local, user_id, user_name, company_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [orderId, order.name || `Local/${orderId}`, order.partner_name, order.partner_id || null, order.date_order, order.state || 'draft', order.amount_total, syncStatus, isLocal, order.user_id, order.user_name, order.company_id]
-        );
-
-        for (const l of lines) {
-            const localLineId = -Math.floor(Math.random() * 1000000);
+        await db.withTransactionAsync(async () => {
+            console.log('[DEBUG] Inserting/Replacing sale_order with ID:', orderId, 'Status:', syncStatus);
             await db.runAsync(
-                `INSERT INTO sale_order_lines (id, order_id, product_id, product_name, product_uom_qty, price_unit, price_subtotal, sync_status, is_local) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [localLineId, orderId, l.product_id, l.product_name, l.quantity, l.price, l.quantity * l.price, syncStatus, isLocal]
+                `INSERT OR REPLACE INTO sale_orders (id, name, partner_name, partner_id, date_order, state, amount_total, global_discount, sync_status, is_local, user_id, user_name, company_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [orderId, order.name || `Local/${orderId}`, order.partner_name, order.partner_id || null, order.date_order, order.state || 'draft', order.amount_total, order.global_discount || 0, syncStatus, isLocal, order.user_id, order.user_name, order.company_id]
             );
-        }
-        console.log('[DEBUG] Sale order saved locally with success.');
+
+            // Limpiar líneas previas si estamos reemplazando
+            await db.runAsync('DELETE FROM sale_order_lines WHERE order_id = ?', [orderId]);
+
+            for (const l of lines) {
+                const localLineId = -(Date.now() + Math.floor(Math.random() * 1000));
+                const lineDisc = l.discount || 0;
+                const subtotal = l.quantity * l.price * (1 - lineDisc / 100);
+                await db.runAsync(
+                    `INSERT INTO sale_order_lines (id, order_id, product_id, product_name, product_uom_qty, price_unit, discount, price_subtotal, sync_status, is_local) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [localLineId, orderId, l.product_id, l.product_name, l.quantity, l.price, lineDisc, subtotal, syncStatus, isLocal]
+                );
+            }
+        });
+        console.log('[DEBUG] Sale order saved locally with success (Transaction).');
     } catch (e: any) {
         console.error('[ERROR] Failed to save sale order locally:', e.message, e);
         throw e;
     }
+};
+
+/**
+ * Intercambia un ID local temporal por uno real de Odoo de forma atómica.
+ * También actualiza las líneas relacionadas.
+ */
+export const swapLocalIdWithOdooId = async (tempId: number, realId: number, newName: string) => {
+    const db = await getDb();
+    await db.withTransactionAsync(async () => {
+        // 1. Actualizar el pedido principal
+        await db.runAsync(
+            'UPDATE sale_orders SET id = ?, name = ?, sync_status = "synced", is_local = 0 WHERE id = ?',
+            [realId, newName, tempId]
+        );
+        // 2. Actualizar las líneas para que apunten al nuevo ID
+        await db.runAsync(
+            'UPDATE sale_order_lines SET order_id = ?, sync_status = "synced", is_local = 0 WHERE order_id = ?',
+            [realId, tempId]
+        );
+    });
 };
 
 export const setInvoiceSiatStatusLocal = async (invoiceId: number, status: string) => {
@@ -481,6 +531,21 @@ export const createInvoiceLocal = async (orderId: number, userId: number | null 
         console.error('Failed to generate local invoice:', e.message);
         throw e;
     }
+};
+
+export const getUnsyncedCount = async (): Promise<number> => {
+    const db = await getDb();
+    const tables = ['sale_orders', 'account_moves', 'partners', 'stock_moves'];
+    let total = 0;
+    for (const table of tables) {
+        try {
+            const res: any = await db.getFirstAsync(`SELECT COUNT(*) as count FROM ${table} WHERE sync_status != 'synced' OR is_local = 1`);
+            total += res?.count || 0;
+        } catch (e) {
+            // Table might not exist or column might be missing
+        }
+    }
+    return total;
 };
 
 // --- SYNC / SEARCH HELPERS ---
@@ -572,6 +637,16 @@ export const saveSaleOrders = async (orders: any[]) => {
     await db.execAsync('BEGIN TRANSACTION');
     try {
         for (const o of orders) {
+            // Deduplication Check! Reemplaza un pedido temporal local que se haya enviado con éxito pero cuyo response nunca llegó
+            if (o.client_order_ref && typeof o.client_order_ref === 'string' && o.client_order_ref.startsWith('APP-')) {
+                const tempLocal: any = await db.getFirstAsync('SELECT id FROM sale_orders WHERE name = ? AND id < 0', [o.client_order_ref]);
+                if (tempLocal && tempLocal.id) {
+                    console.log(`[Deduplication] UUID Match detectado. Reemplazando ID local ${tempLocal.id} con ID real ${o.id}`);
+                    await db.runAsync('UPDATE sale_orders SET id = ?, sync_status = "synced", is_local = 0 WHERE id = ?', [o.id, tempLocal.id]);
+                    await db.runAsync('UPDATE sale_order_lines SET order_id = ?, sync_status = "synced", is_local = 0 WHERE order_id = ?', [o.id, tempLocal.id]);
+                }
+            }
+
             await db.runAsync(
                 `INSERT OR REPLACE INTO sale_orders (id, name, display_name, partner_id, partner_name, date_order, state, amount_total, invoice_id, company_id, user_id, user_name) 
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -620,7 +695,7 @@ export const saveSaleOrders = async (orders: any[]) => {
 export const getSaleOrders = async () => {
     await initDB();
     const db = await getDb();
-    const orders: any[] = await db.getAllAsync('SELECT * FROM sale_orders');
+    const orders: any[] = await db.getAllAsync('SELECT * FROM sale_orders ORDER BY id DESC');
     for (const o of orders) {
         o.lines_data = await db.getAllAsync('SELECT * FROM sale_order_lines WHERE order_id = ?', [o.id]);
         // Normalize fields to match Odoo response structure for UI compatibility
@@ -801,7 +876,7 @@ export const saveStockMoves = async (moves: any[]) => {
 export const getStockMoves = async () => {
     await initDB();
     const db = await getDb();
-    const moves: any[] = await db.getAllAsync('SELECT * FROM stock_moves');
+    const moves: any[] = await db.getAllAsync('SELECT * FROM stock_moves ORDER BY id DESC');
     for (const m of moves) {
         m.lines = await db.getAllAsync('SELECT * FROM stock_move_lines WHERE move_id = ?', [m.id]);
         m.product_id = [0, m.product_name];
@@ -828,6 +903,7 @@ export const getStockMovesWithCoords = async () => {
         FROM stock_moves sm
         LEFT JOIN partners p ON sm.partner_id = p.id
         WHERE sm.state NOT IN ('done', 'cancel')
+        ORDER BY sm.id DESC
     `;
     const rows: any[] = await db.getAllAsync(query);
     return rows.map(m => ({
@@ -868,8 +944,8 @@ export const saveProducts = async (products: any[]) => {
     try {
         for (const p of products) {
             await db.runAsync(
-                `INSERT OR REPLACE INTO products (id, display_name, list_price, qty_available) VALUES (?, ?, ?, ?)`,
-                [p.id, p.display_name, p.list_price || 0, p.qty_available || 0]
+                'INSERT OR REPLACE INTO products (id, display_name, list_price, max_discount, discount_rules, qty_available, sync_status, is_local) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                [p.id, p.display_name, p.list_price, p.max_discount || 0, p.discount_rules || '[]', p.qty_available || 0, p.sync_status || 'synced', p.is_local || 0]
             );
         }
         await db.execAsync('COMMIT');
@@ -889,7 +965,7 @@ export const searchProducts = async (query: string) => {
     await initDB();
     const db = await getDb();
     return await db.getAllAsync(
-        'SELECT id, display_name, list_price, qty_available FROM products WHERE display_name LIKE ? LIMIT 5',
+        'SELECT id, display_name, list_price, qty_available, max_discount, discount_rules FROM products WHERE display_name LIKE ? LIMIT 5',
         [`%${query}%`]
     );
 };
@@ -991,6 +1067,37 @@ export const getUnsyncedRecords = async (tableName: string) => {
     return await db.getAllAsync(`SELECT * FROM ${tableName} WHERE sync_status != 'synced'`);
 };
 
+export const hasUnsyncedData = async (): Promise<boolean> => {
+    const db = await getDb();
+    try {
+        const p = await db.getAllAsync(`SELECT id FROM partners WHERE sync_status != 'synced' LIMIT 1`);
+        if (p && p.length > 0) return true;
+        const s = await db.getAllAsync(`SELECT id FROM sale_orders WHERE sync_status != 'synced' LIMIT 1`);
+        if (s && s.length > 0) return true;
+        
+        // Comprobar tablas que quizás no hayan sido creadas según migraciones
+        try {
+            const sm = await db.getAllAsync(`SELECT id FROM stock_moves WHERE sync_status != 'synced' LIMIT 1`);
+            if (sm && sm.length > 0) return true;
+        } catch(e){}
+        
+        try {
+            const am = await db.getAllAsync(`SELECT id FROM account_moves WHERE sync_status != 'synced' LIMIT 1`);
+            if (am && am.length > 0) return true;
+        } catch(e){}
+        
+        try {
+            const ap = await db.getAllAsync(`SELECT id FROM account_payments WHERE sync_status != 'synced' LIMIT 1`);
+            if (ap && ap.length > 0) return true;
+        } catch(e){}
+        
+        return false;
+    } catch(e) {
+        console.warn('Error checking unsynced data', e);
+        return false;
+    }
+};
+
 export const markSynced = async (tableName: string, id: number, newId?: number) => {
     const db = await getDb();
     if (newId) {
@@ -1016,5 +1123,74 @@ export const deleteLocalDatabase = async () => {
     ];
     for (const t of tables) {
         await db.runAsync(`DELETE FROM ${t}`);
+    }
+};
+
+export const backupDatabase = async () => {
+    try {
+        const FileSystem = require('expo-file-system');
+        const dbName = 'odoo_mobile.db';
+        const dbPath = `${FileSystem.documentDirectory}SQLite/${dbName}`;
+        
+        const backupDir = `${FileSystem.documentDirectory}Backups/`;
+        const dirInfo = await FileSystem.getInfoAsync(backupDir);
+        if (!dirInfo.exists) {
+            await FileSystem.makeDirectoryAsync(backupDir, { intermediates: true });
+        }
+
+        const dateStr = new Date().toISOString().replace(/[:.]/g, '-');
+        const backupPath = `${backupDir}odoo_mobile_backup_${dateStr}.db`;
+
+        await FileSystem.copyAsync({
+            from: dbPath,
+            to: backupPath
+        });
+        
+        console.log('Backup exitoso en:', backupPath);
+        return backupPath;
+    } catch (error) {
+        console.error('Error creando backup de la base de datos:', error);
+        return null;
+    }
+};
+
+export const listBackups = async (): Promise<string[]> => {
+    try {
+        const FileSystem = require('expo-file-system');
+        const backupDir = `${FileSystem.documentDirectory}Backups/`;
+        const dirInfo = await FileSystem.getInfoAsync(backupDir);
+        if (!dirInfo.exists) return [];
+        
+        const files = await FileSystem.readDirectoryAsync(backupDir);
+        // Retornar solo archivos .db y ordenarlos por más reciente
+        return files.filter((f: string) => f.endsWith('.db')).sort().reverse();
+    } catch (e) {
+        console.warn('Error reading backups', e);
+        return [];
+    }
+};
+
+export const loadBackupDatabase = async (fileName: string) => {
+    try {
+        const FileSystem = require('expo-file-system');
+        const backupPath = `${FileSystem.documentDirectory}Backups/${fileName}`;
+        const dbPath = `${FileSystem.documentDirectory}SQLite/odoo_mobile.db`;
+
+        const fileInfo = await FileSystem.getInfoAsync(backupPath);
+        if (!fileInfo.exists) throw new Error('Backup no encontrado');
+
+        // Cerrar y reemplazar
+        await FileSystem.copyAsync({
+            from: backupPath,
+            to: dbPath
+        });
+        console.log('Database restaurada desde', backupPath);
+        
+        dbPromise = null; // reset connection
+        await getDb(); // open again
+        return true;
+    } catch (error) {
+        console.error('Error cargando backup:', error);
+        return false;
     }
 };

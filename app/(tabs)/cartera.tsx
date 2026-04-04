@@ -20,6 +20,7 @@ import { useConfigStore } from '../../src/store/configStore';
 import * as db from '../../src/services/dbService';
 import { getSiatDomain } from '../../src/utils/permissionUtils';
 import { useAuthStore } from '../../src/store/authStore';
+import ListFilters, { DateFilterType } from '../../src/components/ListFilters';
 
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
     UIManager.setLayoutAnimationEnabledExperimental(true);
@@ -63,9 +64,32 @@ export default function CarteraScreen() {
     const [refreshing, setRefreshing] = useState(false);
     const [searchText, setSearchText] = useState('');
     
+    // Filters state
+    const [limit, setLimit] = useState<number>(100);
+    const [offset, setOffset] = useState<number>(0);
+    const [totalCount, setTotalCount] = useState<number>(0);
+    const [dateFilter, setDateFilter] = useState<DateFilterType>('All');
+    
     const isOffline = useConfigStore((state) => state.isOffline);
 
-    const fetchInvoices = async () => {
+    const handleNextPage = () => {
+        if (offset + limit < totalCount) {
+            setOffset(offset + limit);
+            fetchInvoices(false, offset + limit);
+        }
+    };
+
+    const handlePrevPage = () => {
+        const newOffset = Math.max(0, offset - limit);
+        if (newOffset !== offset) {
+            setOffset(newOffset);
+            fetchInvoices(false, newOffset);
+        }
+    };
+
+    const fetchInvoices = async (isPullToRefresh = false, customOffset?: number) => {
+        const currentOffset = customOffset !== undefined ? customOffset : (isPullToRefresh ? 0 : offset);
+        if (isPullToRefresh) setOffset(0);
         try {
             setLoading(true);
             // Load from SQLite (Pendings only as requested: amount_residual > 0)
@@ -86,8 +110,15 @@ export default function CarteraScreen() {
                             'amount_residual', 'invoice_line_ids', 'invoice_user_id', 
                             'siat_estado', 'siat_qr_string', 'siat_qr_image', 'siat_cuf'
                         ],
-                        limit: 100
+                        limit: limit,
+                        offset: currentOffset,
+                        order: 'id desc'
                     }, true);
+
+                    const count: number = await callOdoo('account.move', 'search_count', {
+                        domain: domain
+                    }, true);
+                    setTotalCount(count);
 
                     if (result && Array.isArray(result)) {
                         await db.saveAccountMoves(result);
@@ -271,6 +302,20 @@ export default function CarteraScreen() {
                     />
                 </View>
             </View>
+
+            <ListFilters
+                limit={limit}
+                setLimit={(v) => { setLimit(v); setOffset(0); }}
+                dateFilter={dateFilter}
+                setDateFilter={(v) => { setDateFilter(v); setOffset(0); }}
+                onApply={() => { setOffset(0); fetchInvoices(false); }}
+                showDateFilter={false}
+                disabled={isOffline || useAuthStore.getState().isAuditMode}
+                offset={offset}
+                totalCount={totalCount}
+                onNextPage={handleNextPage}
+                onPrevPage={handlePrevPage}
+            />
 
             <FlatList
                 data={filteredInvoices}
