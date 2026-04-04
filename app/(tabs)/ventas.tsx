@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import {
     StyleSheet,
     View,
@@ -17,12 +17,13 @@ import {
     Linking
 } from 'react-native';
 import { FontAwesome } from '@expo/vector-icons';
-import { callOdoo } from '../../src/api/odooClient';
+import { callOdoo, pingOdoo } from '../../src/api/odooClient';
+import { LoadingOverlay } from '../../src/components/LoadingOverlay';
 import { useConfigStore } from '../../src/store/configStore';
 import { usePartnerStore } from '../../src/store/usePartnerStore';
 import { useProductStore } from '../../src/store/useProductStore';
 import * as db from '../../src/services/dbService';
-import { runSync, uploadAndSync, syncInvoicesByIds } from '../../src/services/syncService';
+import { runSync, uploadAndSync, syncInvoicesByIds, syncPortalMetadata } from '../../src/services/syncService';
 import { getSiatDomain } from '../../src/utils/permissionUtils';
 import { useAuthStore } from '../../src/store/authStore';
 import ListFilters, { DateFilterType } from '../../src/components/ListFilters';
@@ -129,6 +130,12 @@ export default function VentasScreen() {
     const [mainSearchQuery, setMainSearchQuery] = useState('');
     const [filteredResult, setFilteredResult] = useState<SaleOrder[]>([]);
     const [isSavingSales, setIsSavingSales] = useState(false);
+    const [loadingMessage, setLoadingMessage] = useState('Procesando...');
+    
+    // Edit/Duplicate state
+    const [isEditing, setIsEditing] = useState(false);
+    const [editingOrderId, setEditingOrderId] = useState<number | null>(null);
+    const [generatedXmlId, setGeneratedXmlId] = useState<string | null>(null);
     
     // Filters state
     const [limit, setLimit] = useState<number>(50);
@@ -484,14 +491,30 @@ export default function VentasScreen() {
         }
 
         try {
+            setLoadingMessage('Verificando conexión...');
             setIsSavingSales(true);
+            
+            if (!isOffline) {
+                const p = await pingOdoo();
+                if (p.status !== 'ok') {
+                    if (p.status === 'no-internet') {
+                        Alert.alert('Sin Internet', 'No tienes acceso a Internet. La venta se guardará localmente en Modo Offline para su futura sincronización.');
+                    } else if (p.status === 'odoo-down') {
+                        Alert.alert('Servidor Inaccesible', `Odoo no responde (${p.message}). La venta se guardará localmente en Modo Offline para su futura sincronización.`);
+                    }
+                    // Forzamos offline preventivo para que el usuario no espere en balde
+                    useConfigStore.getState().toggleOffline();
+                }
+            }
+
+            setLoadingMessage('Guardando Venta...');
             setLoading(true);
 
             const user = useAuthStore.getState().user;
             const gDisc = parseFloat(globalDiscount) || 0;
             const amountTotal = quoteLines.reduce((acc, l) => acc + (l.price * l.quantity * (1 - (l.discount || 0) / 100)), 0) * (1 - gDisc / 100);
 
-            const commonVals = {
+            const commonVals: any = {
                 partner_id: selectedPartner.id,
                 partner_name: selectedPartner.display_name,
                 date_order: new Date().toISOString().slice(0, 19).replace('T', ' '),
@@ -500,13 +523,15 @@ export default function VentasScreen() {
                 user_name: user?.name || '',
                 company_id: user?.company_id || 1,
                 global_discount: gDisc,
-                state: 'draft'
+                state: 'draft',
+                xml_id: generatedXmlId
             };
 
-            // 1. GUARDADO LOCAL INMEDIATO (El usuario no espera)
-            const tempOrderId = -(Date.now());
-            const clientOrderRef = `APP-${Math.abs(tempOrderId)}-${Math.floor(Math.random() * 1000)}`;
-            await db.createSaleOrderLocal({ ...commonVals, id: tempOrderId, name: clientOrderRef, sync_status: 'new' }, quoteLines);
+            // 1. GUARDADO LOCAL INMEDIATO
+            const orderId = isEditing ? editingOrderId! : -(Date.now());
+            const clientOrderRef = isEditing ? undefined : `APP-${Math.abs(orderId)}-${Math.floor(Math.random() * 1000)}`;
+            
+            await db.createSaleOrderLocal({ ...commonVals, id: orderId, name: clientOrderRef, sync_status: 'new' }, quoteLines);
             
             // FEEDBACK INMEDIATO
             fetchData();
@@ -515,16 +540,19 @@ export default function VentasScreen() {
             setSelectedPartner(null);
             setPartnerSearch('');
             setGlobalDiscount('0');
+            setIsEditing(false);
+            setEditingOrderId(null);
+            const currentGeneratedXmlId = generatedXmlId;
+            setGeneratedXmlId(null);
             setLoading(false);
             setIsSavingSales(false);
 
-            // 2. SINCRONIZACIÓN EN SEGUNDO PLANO (No bloquea la UI)
+            // 2. SINCRONIZACIÓN EN SEGUNDO PLANO
             if (!isOffline) {
-                // Definimos la tarea de fondo
                 const backgroundSync = async () => {
                     try {
                         const sqlite = await db.getDb();
-                        await sqlite.runAsync('UPDATE sale_orders SET sync_status = "syncing" WHERE id = ?', [tempOrderId]);
+                        await sqlite.runAsync('UPDATE sale_orders SET sync_status = "syncing" WHERE id = ?', [orderId]);
 
                         const orderLinesOdoo = quoteLines.map(line => [0, 0, {
                             product_id: line.product_id,
@@ -533,44 +561,58 @@ export default function VentasScreen() {
                             discount: line.discount || 0,
                         }]);
 
-                        const response: any = await callOdoo('sale.order', 'create', {
-                            vals_list: [{
+                        let finalOdooId: number | null = null;
+
+                        if (isEditing && orderId > 0) {
+                            // MODO EDICIÓN
+                            await callOdoo('sale.order', 'write', [[orderId], {
+                                partner_id: commonVals.partner_id,
+                                order_line: [[5, 0, 0], ...orderLinesOdoo.map(l => [0, 0, l[2]])]
+                            }], true);
+                            finalOdooId = orderId;
+                        } else {
+                            const createVals: any = {
                                 partner_id: commonVals.partner_id,
                                 user_id: commonVals.user_id,
                                 company_id: commonVals.company_id,
                                 client_order_ref: clientOrderRef,
                                 order_line: orderLinesOdoo,
-                            }]
-                        }, true, undefined, 10000); // 10s timeout
+                            };
 
-                        const newOdooId = (Array.isArray(response) && response.length > 0) 
-                            ? (response[0].id || response[0]) 
-                            : (response && typeof response === 'object' ? response.id || response.result : response);
+                            const response: any = await callOdoo('sale.order', 'create', {
+                                vals_list: [createVals]
+                            }, true, undefined, 30000);
 
-                        if (newOdooId && typeof newOdooId === 'number') {
+                            finalOdooId = (Array.isArray(response) && response.length > 0) 
+                                ? (response[0].id || response[0]) 
+                                : (response && typeof response === 'object' ? response.id || response.result : response);
+                        }
+
+                        if (finalOdooId && typeof finalOdooId === 'number') {
                             if (shouldConfirm) {
-                                await callOdoo('sale.order', 'action_confirm', { ids: [newOdooId] }, true, undefined, 10000);
+                                await callOdoo('sale.order', 'action_confirm', { ids: [finalOdooId] }, true, undefined, 30000);
                             }
-                            await db.swapLocalIdWithOdooId(tempOrderId, newOdooId, `S${newOdooId.toString().padStart(5, '0')}`);
-                            console.log('[BackgroundSync] Pedido sincronizado:', newOdooId);
-                            fetchData(); // Actualizamos la lista para que el usuario vea el checkmark de sincronizado
-                        } else {
-                            throw new Error('Servidor retornó respuesta inválida');
+                            
+                            if (!isEditing || orderId < 0) {
+                                await db.swapLocalIdWithOdooId(orderId, finalOdooId, `S${finalOdooId.toString().padStart(5, '0')}`);
+                            } else {
+                                await sqlite.runAsync('UPDATE sale_orders SET sync_status = "synced" WHERE id = ?', [finalOdooId]);
+                            }
+                            console.log('[BackgroundSync] Operación completada:', finalOdooId);
+                            fetchData();
                         }
                     } catch (e: any) {
-                        console.warn('[BackgroundSync] Falló, quedará para el SyncService:', e.message);
+                        console.warn('[BackgroundSync] Error:', e.message);
+                        Alert.alert('Fallo de Sincronización Odoo', `Motivo del servidor: ${e.message}`);
                         const sqlite = await db.getDb();
-                        await sqlite.runAsync('UPDATE sale_orders SET sync_status = "new" WHERE id = ?', [tempOrderId]);
+                        await sqlite.runAsync('UPDATE sale_orders SET sync_status = "new" WHERE id = ?', [orderId]);
                     }
                 };
-
-                // Lanzar sin await
                 backgroundSync();
             }
-
         } catch (error: any) {
-            console.error('[ERROR] Fallo al guardar venta local:', error);
-            Alert.alert('Error', 'No se pudo guardar la venta localmente.');
+            console.error('[ERROR] saveQuotation:', error);
+            Alert.alert('Error', 'No se pudo procesar la venta.');
             setLoading(false);
             setIsSavingSales(false);
         }
@@ -833,116 +875,227 @@ export default function VentasScreen() {
             setLoading(false);
         }
     };
+    const handleEditOrder = useCallback(async (order: SaleOrder) => {
+        try {
+            setLoading(true);
+            setIsEditing(true);
+            setEditingOrderId(order.id);
+            setGeneratedXmlId(order.xml_id || null);
+            
+            // Cargar datos del cliente
+            setSelectedPartner({
+                id: order.partner_id[0],
+                display_name: order.partner_id[1]
+            });
 
-    const renderCard = ({ item }: { item: SaleOrder }) => (
+            // Cargar líneas (si no están ya en el objeto item, las buscamos en SQLite)
+            let lines = order.lines_data || [];
+            if (lines.length === 0) {
+                const dbInst = await db.getDb();
+                lines = await dbInst.getAllAsync('SELECT * FROM sale_order_lines WHERE order_id = ?', [order.id]);
+            }
+
+            const mappedLines = lines.map((l: any) => ({
+                product_id: l.product_id[0] || l.product_id,
+                product_name: l.product_name || l.product_id[1] || 'Producto',
+                quantity: l.product_uom_qty,
+                price: l.price_unit,
+                discount: l.discount || 0,
+                max_discount: l.max_discount || 0
+            }));
+
+            setQuoteLines(mappedLines);
+            setGlobalDiscount(order.global_discount?.toString() || '0');
+            setModalVisible(true);
+        } catch (error) {
+            console.error('Error in handleEditOrder:', error);
+            Alert.alert('Error', 'No se pudo cargar el pedido para editar.');
+        } finally {
+            setLoading(false);
+        }
+    }, []);
+
+    const handleDuplicateOrder = useCallback(async (order: SaleOrder) => {
+        try {
+            setLoading(true);
+            setIsEditing(false); // Es una creación nueva
+            setEditingOrderId(null);
+            
+            // Generar xml_id único para el duplicado
+            const newXmlId = `APP-SO-DUPE-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+            setGeneratedXmlId(newXmlId);
+
+            setSelectedPartner({
+                id: order.partner_id[0],
+                display_name: order.partner_id[1]
+            });
+
+            let lines = order.lines_data || [];
+            if (lines.length === 0) {
+                const dbInst = await db.getDb();
+                lines = await dbInst.getAllAsync('SELECT * FROM sale_order_lines WHERE order_id = ?', [order.id]);
+            }
+
+            const mappedLines = lines.map((l: any) => ({
+                product_id: l.product_id[0] || l.product_id,
+                product_name: l.product_name || l.product_id[1] || 'Producto',
+                quantity: l.product_uom_qty,
+                price: l.price_unit,
+                discount: l.discount || 0,
+                max_discount: l.max_discount || 0
+            }));
+
+            setQuoteLines(mappedLines);
+            setGlobalDiscount(order.global_discount?.toString() || '0');
+            setModalVisible(true);
+        } catch (error) {
+            console.error('Error in handleDuplicateOrder:', error);
+            Alert.alert('Error', 'No se pudo duplicar el pedido.');
+        } finally {
+            setLoading(false);
+        }
+    }, []);
+
+    // Card Component optimizado con Memo
+    const SaleOrderCard = React.memo(({ item, onEdit, onDuplicate, onViewDetail, onConfirm, onViewInvoice, onCreateInvoice }: { 
+        item: SaleOrder, 
+        onEdit: (o: SaleOrder) => void, 
+        onDuplicate: (o: SaleOrder) => void,
+        onViewDetail: (o: SaleOrder) => void,
+        onConfirm: (id: number) => void,
+        onViewInvoice: (invoiceId: number) => void,
+        onCreateInvoice: (id: number) => void
+    }) => (
         <View style={styles.card}>
-            <View style={styles.cardHeader}>
-                <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
-                    <Text style={styles.orderName} numberOfLines={1}>{item.name || item.display_name}</Text>
-                    {item.is_local === 1 && (
-                        <FontAwesome name="cloud-upload" size={16} color="#F59E0B" style={{ marginLeft: 8 }} />
+            <TouchableOpacity 
+                style={styles.cardContent} 
+                onPress={() => onViewDetail(item)}
+            >
+                <View style={styles.cardHeader}>
+                    <View style={{ flex: 1 }}>
+                        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                            <Text style={styles.orderName}>{item.name || item.display_name}</Text>
+                            {item.is_local === 1 && (
+                                <FontAwesome name="cloud-upload" size={14} color="#F59E0B" style={{ marginLeft: 6 }} />
+                            )}
+                        </View>
+                        <Text style={styles.partnerName} numberOfLines={1}>{item.partner_id[1]}</Text>
+                    </View>
+                    <View style={[styles.statusBadge, 
+                        item.state === 'draft' ? styles.statusDraft : 
+                        item.state === 'sale' ? styles.statusSale : styles.statusDone
+                    ]}>
+                        <Text style={styles.statusText}>
+                            {item.state === 'draft' ? 'BORRADOR' : 
+                             item.state === 'sale' ? 'PEDIDO' : 'HECHO'}
+                        </Text>
+                    </View>
+                </View>
+
+                {/* Vista previa de Items (Registro de ítems) */}
+                <View style={styles.itemsPreview}>
+                    {item.lines_data?.slice(0, 3).map((line: any, idx: number) => (
+                        <Text key={idx} style={styles.itemLineText} numberOfLines={1}>
+                             • {line.product_name || line.product_id[1]}: {line.product_uom_qty} x Bs. {line.price_unit}
+                        </Text>
+                    ))}
+                    {item.lines_data && item.lines_data.length > 3 && (
+                        <Text style={styles.moreItemsText}>... y {item.lines_data.length - 3} productos más</Text>
                     )}
                 </View>
-                <View style={[styles.statusBadge, { backgroundColor: item.state === 'sale' ? '#D1FAE5' : '#FEF3C7' }]}>
-                    <Text style={[styles.statusText, { color: item.state === 'sale' ? '#065F46' : '#92400E' }]}>
-                        {item.state === 'sale' ? (item.is_local === 1 ? 'Pedido (Local)' : 'Pedido') : 'Cotización'}
-                    </Text>
-                </View>
-            </View>
 
-            <View style={styles.cardBody}>
-                <View style={styles.infoRow}>
-                    <FontAwesome name="user" size={14} color="#6B7280" />
-                    <Text style={styles.partnerName}>
-                        {Array.isArray(item.partner_id) ? item.partner_id[1] : (item as any).partner_name || 'Individual'}
-                    </Text>
-                </View>
-                <View style={styles.infoRow}>
-                    <FontAwesome name="calendar" size={14} color="#6B7280" />
-                    <Text style={styles.dateText}>{new Date(item.date_order).toLocaleDateString()}</Text>
-                </View>
-                {item.user_name && (
+                <View style={[styles.orderInfo, { borderTopWidth: 0, marginTop: 5 }]}>
                     <View style={styles.infoRow}>
-                        <FontAwesome name="id-badge" size={14} color="#00A09D" />
-                        <Text style={[styles.dateText, { color: '#00A09D', fontWeight: '500' }]}>
-                            Responsable: {item.user_name}
-                        </Text>
-                    </View>
-                )}
-
-                <View style={styles.divider} />
-
-                {item.lines_data?.map((line, idx) => (
-                    <View key={idx} style={styles.linePreview}>
-                        <Text style={styles.lineText} numberOfLines={1}>
-                            • {Array.isArray(line.product_id) ? line.product_id[1] : (line as any).product_name} (x{line.product_uom_qty})
-                        </Text>
-                    </View>
-                ))}
-
-                <View style={styles.totalRow}>
-                    <View>
-                        <Text style={styles.totalLabel}>TOTAL</Text>
-                        <Text style={styles.totalValue}>Bs. {item.amount_total.toFixed(2)}</Text>
-                    </View>
-                    
-                    <View style={styles.actionRow}>
-                        {/* Funciones deshabilitadas en modo auditoría */}
-                        {!(useAuthStore.getState().isAuditMode) && (
-                            <>
-                                {( (item.state === 'draft' || item.state === 'sent') && permissions?.confirm_sale ) && (
-                                    <TouchableOpacity
-                                        style={styles.confirmInlineButton}
-                                        onPress={() => confirmExistingOrder(item.id)}
-                                    >
-                                        <FontAwesome name="check-circle" size={14} color="#fff" />
-                                        <Text style={styles.confirmInlineText}>CONFIRMAR</Text>
-                                    </TouchableOpacity>
-                                )}
-
-                                {item.state === 'sale' && !item.invoice_id && permissions?.confirm_sale && (
-                                    <TouchableOpacity
-                                        style={styles.invoiceButton}
-                                        onPress={() => handleCreateInvoice(item.id)}
-                                    >
-                                        <FontAwesome name="file-text" size={14} color="#fff" />
-                                        <Text style={styles.actionText}>FACTURAR</Text>
-                                    </TouchableOpacity>
-                                )}
-                            </>
-                        )}
-
-                        {item.invoice_id && permissions?.view_invoices && (
-                            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                                <TouchableOpacity
-                                    style={styles.viewInvoiceButton}
-                                    onPress={() => viewInvoiceDetail(item.invoice_id!)}
-                                >
-                                    <FontAwesome name="eye" size={14} color="#714B67" />
-                                    <Text style={[styles.actionText, { color: '#714B67' }]}>VER FACTURA</Text>
-                                </TouchableOpacity>
-                                <View style={[styles.badge, styles.badgePosted, { marginLeft: 8 }]}>
-                                    <Text style={styles.badgeTextSmall}>FACTURADA</Text>
-                                </View>
-                            </View>
-                        )}
+                        <FontAwesome name="calendar" size={12} color="#6B7280" />
+                        <Text style={styles.infoText}>{new Date(item.date_order).toLocaleDateString()}</Text>
+                        
+                        <View style={{ width: 15 }} />
+                        
+                        <FontAwesome name="money" size={12} color="#6B7280" />
+                        <Text style={styles.infoText}>Bs. {item.amount_total.toFixed(2)}</Text>
                     </View>
                 </View>
+            </TouchableOpacity>
+
+            <View style={styles.cardActions}>
+                {item.state === 'draft' && (
+                    <TouchableOpacity 
+                        style={[styles.actionButton, styles.confirmInlineButton]}
+                        onPress={() => onConfirm(item.id)}
+                    >
+                        <FontAwesome name="check" size={14} color="#fff" />
+                        <Text style={styles.actionButtonText}>CONFIRMAR</Text>
+                    </TouchableOpacity>
+                )}
+                {(item.state === 'sale' || item.state === 'done') && !item.invoice_id && (
+                    <TouchableOpacity 
+                        style={[styles.actionButton, { backgroundColor: '#3B82F6', marginLeft: 8 }]}
+                        onPress={() => onCreateInvoice(item.id)}
+                    >
+                        <FontAwesome name="file-text-o" size={14} color="#fff" />
+                        <Text style={styles.actionButtonText}>FACTURAR</Text>
+                    </TouchableOpacity>
+                )}
+                {item.invoice_id ? (
+                    <TouchableOpacity 
+                        style={[styles.actionButton, { backgroundColor: '#8B5CF6' }]}
+                        onPress={() => onViewInvoice(item.invoice_id as number)}
+                    >
+                        <FontAwesome name="file-text" size={14} color="#fff" />
+                        <Text style={styles.actionButtonText}>VER FACTURA</Text>
+                    </TouchableOpacity>
+                ) : null}
+                <TouchableOpacity 
+                    style={[styles.actionButton, styles.editButton]}
+                    onPress={() => onEdit(item)}
+                >
+                    <FontAwesome name="pencil" size={14} color="#fff" />
+                    <Text style={styles.actionButtonText}>EDITAR</Text>
+                </TouchableOpacity>
+                <TouchableOpacity 
+                    style={[styles.actionButton, styles.duplicateButton]}
+                    onPress={() => onDuplicate(item)}
+                >
+                    <FontAwesome name="copy" size={14} color="#fff" />
+                    <Text style={styles.actionButtonText}>DUPLICAR</Text>
+                </TouchableOpacity>
             </View>
         </View>
+    ));
+
+    const renderCard = ({ item }: { item: SaleOrder }) => (
+        <SaleOrderCard 
+            item={item} 
+            onEdit={handleEditOrder} 
+            onDuplicate={handleDuplicateOrder}
+            onViewDetail={handleEditOrder}
+            onConfirm={confirmExistingOrder}
+            onViewInvoice={viewInvoiceDetail}
+            onCreateInvoice={handleCreateInvoice}
+        />
     );
+
 
     const isAuditMode = useAuthStore.getState().isAuditMode;
 
     return (
         <View style={styles.container}>
+            <LoadingOverlay visible={isSavingSales} message={loadingMessage} />
             <View style={styles.header}>
                 <Text style={styles.headerTitle}>Ventas / Sectores</Text>
                 <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                     {permissions?.create_sale && !isAuditMode && (
                         <TouchableOpacity 
                             style={[styles.newButton, { marginRight: 15 }]} 
-                            onPress={() => setModalVisible(true)}
+                            onPress={() => {
+                                setIsEditing(false);
+                                setEditingOrderId(null);
+                                setGeneratedXmlId(null);
+                                setSelectedPartner(null);
+                                setQuoteLines([]);
+                                setGlobalDiscount('0');
+                                setModalVisible(true);
+                            }}
                         >
                             <FontAwesome name="plus" size={14} color="#fff" />
                             <Text style={styles.newButtonText}>NUEVA</Text>
@@ -991,9 +1144,6 @@ export default function VentasScreen() {
                 keyExtractor={(item) => item.id.toString()}
                 renderItem={renderCard}
                 contentContainerStyle={styles.listContent}
-                refreshControl={
-                    <RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={['#714B67']} />
-                }
                 ListEmptyComponent={
                     <View style={styles.emptyContainer}>
                         <FontAwesome name="shopping-basket" size={80} color="#E5E7EB" />
@@ -1110,8 +1260,8 @@ export default function VentasScreen() {
                             {quoteLines.length === 0 ? (
                                 <Text style={styles.placeholderText}>No se han agregado productos aún.</Text>
                             ) : (
-                                quoteLines.map(line => (
-                                    <View key={line.product_id} style={styles.quoteLine}>
+                                quoteLines.map((line, index) => (
+                                    <View key={`${line.product_id}-${index}`} style={styles.quoteLine}>
                                         <View style={{ flex: 1 }}>
                                             <Text style={styles.lineName} numberOfLines={1}>{line.product_name}</Text>
                                             <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 5 }}>
@@ -1495,76 +1645,79 @@ const styles = StyleSheet.create({
     cardHeader: {
         flexDirection: 'row',
         justifyContent: 'space-between',
-        alignItems: 'center',
-        padding: 12,
-        backgroundColor: '#F9FAFB',
-        borderBottomWidth: 1,
-        borderBottomColor: '#F3F4F6',
+        alignItems: 'flex-start',
+        marginBottom: 10,
+    },
+    cardContent: {
+        padding: 15,
+        paddingBottom: 5,
     },
     orderName: {
+        fontSize: 18,
+        fontWeight: 'bold',
+        color: '#111827',
+    },
+    partnerName: {
         fontSize: 14,
-        fontWeight: 'bold',
-        color: '#374151',
+        color: '#4B5563',
+        marginTop: 2,
     },
-    statusBadge: {
-        paddingHorizontal: 8,
-        paddingVertical: 2,
-        borderRadius: 4,
-    },
-    statusText: {
-        fontSize: 10,
-        fontWeight: 'bold',
-        textTransform: 'uppercase',
-    },
-    cardBody: {
-        padding: 15,
+    orderInfo: {
+        marginTop: 5,
+        borderTopWidth: 1,
+        borderTopColor: '#F3F4F6',
+        paddingTop: 10,
     },
     infoRow: {
         flexDirection: 'row',
         alignItems: 'center',
-        marginBottom: 6,
-    },
-    partnerName: {
-        fontSize: 16,
-        fontWeight: 'bold',
-        color: '#111827',
-        marginLeft: 10,
-    },
-    dateText: {
-        fontSize: 13,
-        color: '#6B7280',
-        marginLeft: 10,
-    },
-    divider: {
-        height: 1,
-        backgroundColor: '#F3F4F6',
-        marginVertical: 10,
-    },
-    linePreview: {
         marginBottom: 4,
     },
-    lineText: {
+    infoText: {
         fontSize: 13,
-        color: '#4B5563',
+        color: '#6B7280',
+        marginLeft: 8,
     },
-    totalRow: {
+    statusBadge: {
+        paddingHorizontal: 8,
+        paddingVertical: 4,
+        borderRadius: 6,
+    },
+    statusDraft: { backgroundColor: '#F3F4F6' },
+    statusSale: { backgroundColor: '#D1FAE5' },
+    statusDone: { backgroundColor: '#DBEAFE' },
+    statusText: {
+        fontSize: 10,
+        fontWeight: 'bold',
+        color: '#374151',
+    },
+    cardActions: {
         flexDirection: 'row',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        marginTop: 15,
-        paddingTop: 10,
         borderTopWidth: 1,
         borderTopColor: '#F3F4F6',
+        padding: 8,
+        justifyContent: 'space-between',
     },
-    totalLabel: {
+    actionButton: {
+        flex: 1,
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        paddingVertical: 8,
+        borderRadius: 8,
+        marginHorizontal: 4,
+    },
+    editButton: {
+        backgroundColor: '#F59E0B',
+    },
+    duplicateButton: {
+        backgroundColor: '#6366F1',
+    },
+    actionButtonText: {
+        color: '#fff',
         fontSize: 12,
         fontWeight: 'bold',
-        color: '#9CA3AF',
-    },
-    totalValue: {
-        fontSize: 18,
-        fontWeight: 'bold',
-        color: '#714B67',
+        marginLeft: 6,
     },
     actionRow: {
         flexDirection: 'row',
@@ -1984,5 +2137,22 @@ const styles = StyleSheet.create({
         flexDirection: 'row',
         alignItems: 'center',
         justifyContent: 'center',
+    },
+    itemsPreview: {
+        marginTop: 8,
+        paddingTop: 8,
+        borderTopWidth: 1,
+        borderTopColor: '#F3F4F6',
+    },
+    itemLineText: {
+        fontSize: 12,
+        color: '#4B5563',
+        marginBottom: 2,
+    },
+    moreItemsText: {
+        fontSize: 11,
+        color: '#9CA3AF',
+        fontStyle: 'italic',
+        marginTop: 2,
     },
 });

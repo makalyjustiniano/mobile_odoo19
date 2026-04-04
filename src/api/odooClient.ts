@@ -19,6 +19,50 @@ interface OdooConnection {
   sessionId?: string;
 }
 
+export type PingResult = {
+  status: 'ok' | 'no-internet' | 'odoo-down';
+  message?: string;
+};
+
+export const pingOdoo = async (connectionOverride?: OdooConnection, timeoutMs: number = 3000): Promise<PingResult> => {
+  const connection = connectionOverride || resolveConnection();
+  if (!connection.url) {
+    return { status: 'odoo-down', message: 'No hay URL configurada.' };
+  }
+
+  const cleanBase = connection.url.endsWith('/') ? connection.url.slice(0, -1) : connection.url;
+  const pingUrl = `${cleanBase}/web/login`;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(pingUrl, {
+      method: 'GET',
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (response.ok || response.status === 401 || response.status === 403) {
+      return { status: 'ok' };
+    }
+    
+    return { status: 'odoo-down', message: `Odoo respondió con error ${response.status}` };
+  } catch (error: any) {
+    clearTimeout(timeoutId);
+    // Fetch arroja TypeError para fallos de red en React Native (No internet)
+    if (error.name === 'AbortError') {
+      return { status: 'odoo-down', message: 'El servidor de Odoo tardó demasiado en responder (Timeout).' };
+    }
+    // "Network request failed" es típico de falta de internet o DNS
+    if (error.message?.includes('Network request failed') || error.message?.includes('Failed to fetch')) {
+        return { status: 'no-internet', message: 'No hay conexión a Internet o el dominio es inaccesible.' };
+    }
+    return { status: 'odoo-down', message: 'Error de conexión con el servidor.' };
+  }
+};
+
 const resolveConnection = (): OdooConnection => {
   const { user } = useAuthStore.getState();
   const { getActiveProfile } = useConfigStore.getState();

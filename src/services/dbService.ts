@@ -31,6 +31,8 @@ export const initDB = async () => {
         console.log('Initializing SQLite database (v2)...');
         const db = await getDb();
         await db.runAsync('PRAGMA journal_mode = WAL');
+        await db.runAsync('PRAGMA synchronous = NORMAL');
+        await db.runAsync('PRAGMA temp_store = MEMORY');
 
         // SOLUCIÓN DE EMERGENCIA: Si falta company_id en partners, borramos para recrear limpio
         try {
@@ -43,12 +45,18 @@ export const initDB = async () => {
                 await db.runAsync('DROP TABLE IF EXISTS account_moves');
             }
             
-            // Migración incremental para responsables
-            const saleOrderInfo: any[] = await db.getAllAsync('PRAGMA table_info(sale_orders)');
-            if (saleOrderInfo.length > 0 && !saleOrderInfo.some(col => col.name === 'user_name')) {
-                console.log('Añadiendo columna user_name a sale_orders...');
-                await db.runAsync('ALTER TABLE sale_orders ADD COLUMN user_name TEXT');
+            // Migraciones incrementales
+            const soInfo: any[] = await db.getAllAsync('PRAGMA table_info(sale_orders)');
+            if (soInfo.length > 0) {
+                if (!soInfo.some(col => col.name === 'user_name')) {
+                    await db.runAsync('ALTER TABLE sale_orders ADD COLUMN user_name TEXT');
+                }
+                if (!soInfo.some(col => col.name === 'xml_id')) {
+                    console.log('Añadiendo columna xml_id a sale_orders...');
+                    await db.runAsync('ALTER TABLE sale_orders ADD COLUMN xml_id TEXT');
+                }
             }
+
             const accMoveInfo: any[] = await db.getAllAsync('PRAGMA table_info(account_moves)');
             if (accMoveInfo.length > 0 && !accMoveInfo.some(col => col.name === 'invoice_user_name')) {
                 console.log('Añadiendo columna invoice_user_name a account_moves...');
@@ -130,6 +138,7 @@ export const initDB = async () => {
             user_id INTEGER,
             user_name TEXT,
             global_discount REAL DEFAULT 0,
+            xml_id TEXT,
             sync_status TEXT DEFAULT 'synced',
             is_local INTEGER DEFAULT 0
         )`);
@@ -261,7 +270,23 @@ export const initDB = async () => {
             }
         }
 
-        // 2. Migration logic
+        // 3. Crear Índices de Rendimiento
+        const createIndexes = [
+            'CREATE INDEX IF NOT EXISTS idx_partners_name ON partners(display_name)',
+            'CREATE INDEX IF NOT EXISTS idx_products_name ON products(display_name)',
+            'CREATE INDEX IF NOT EXISTS idx_so_date ON sale_orders(date_order)',
+            'CREATE INDEX IF NOT EXISTS idx_sol_order ON sale_order_lines(order_id)',
+            'CREATE INDEX IF NOT EXISTS idx_so_partner ON sale_orders(partner_id)',
+            'CREATE INDEX IF NOT EXISTS idx_so_sync ON sale_orders(sync_status)',
+            'CREATE INDEX IF NOT EXISTS idx_am_date ON account_moves(invoice_date)',
+            'CREATE INDEX IF NOT EXISTS idx_am_partner ON account_moves(partner_id)'
+        ];
+
+        for (const idxSql of createIndexes) {
+            await db.runAsync(idxSql);
+        }
+
+        // 4. Migration logic
         const addColumnIfMissing = async (tableName: string, columnName: string, columnDef: string) => {
             try {
                 const tableInfo: any[] = await db.getAllAsync(`PRAGMA table_info(${tableName})`);
@@ -412,8 +437,8 @@ export const createSaleOrderLocal = async (order: any, lines: any[]) => {
         await db.withTransactionAsync(async () => {
             console.log('[DEBUG] Inserting/Replacing sale_order with ID:', orderId, 'Status:', syncStatus);
             await db.runAsync(
-                `INSERT OR REPLACE INTO sale_orders (id, name, partner_name, partner_id, date_order, state, amount_total, global_discount, sync_status, is_local, user_id, user_name, company_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [orderId, order.name || `Local/${orderId}`, order.partner_name, order.partner_id || null, order.date_order, order.state || 'draft', order.amount_total, order.global_discount || 0, syncStatus, isLocal, order.user_id, order.user_name, order.company_id]
+                `INSERT OR REPLACE INTO sale_orders (id, name, partner_name, partner_id, date_order, state, amount_total, global_discount, xml_id, sync_status, is_local, user_id, user_name, company_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [orderId, order.name || `Local/${orderId}`, order.partner_name, order.partner_id || null, order.date_order, order.state || 'draft', order.amount_total, order.global_discount || 0, order.xml_id || null, syncStatus, isLocal, order.user_id, order.user_name, order.company_id]
             );
 
             // Limpiar líneas previas si estamos reemplazando
@@ -708,9 +733,9 @@ export const getSaleOrders = async () => {
     for (const o of orders) {
         o.lines_data = await db.getAllAsync('SELECT * FROM sale_order_lines WHERE order_id = ?', [o.id]);
         // Normalize fields to match Odoo response structure for UI compatibility
-        o.partner_id = [0, o.partner_name];
+        o.partner_id = [o.partner_id || 0, o.partner_name];
         for (const l of o.lines_data) {
-            l.product_id = [l.product_id, l.product_name];
+            l.product_id = [l.product_id || 0, l.product_name];
         }
     }
     return orders;

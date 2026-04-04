@@ -6,7 +6,6 @@ import { usePartnerStore } from '../../src/store/usePartnerStore';
 import { useProductStore } from '../../src/store/useProductStore';
 import { useConfigStore } from '../../src/store/configStore';
 import { useAuthStore } from '../../src/store/authStore';
-import { uploadAndSync } from '../../src/services/syncService';
 
 const { width } = Dimensions.get('window');
 const COLUMN_WIDTH = (width - 40) / 2; // Subtracting padding
@@ -58,35 +57,11 @@ export default function DashboardScreen() {
       route: '/(tabs)/configuracion',
       visible: true,
     },
-    {
-      title: 'Sincronizar',
-      icon: 'refresh',
-      color: '#F59E0B',
-      action: 'sync',
-      visible: true,
-    },
   ].filter(item => item.visible);
 
   const isOffline = useConfigStore((state) => state.isOffline);
 
   const [isSyncing, setIsSyncing] = React.useState(false);
-
-  const handleSync = async () => {
-    if (isSyncing) return;
-    setIsSyncing(true);
-    try {
-      console.log('Starting full bidirectional sync...');
-      await uploadAndSync((msg: string) => {
-          console.log(msg);
-      });
-      Alert.alert('Éxito', 'Sincronización total finalizada. Cambios locales subidos y datos actualizados desde Odoo.');
-    } catch (error: any) {
-        console.error('Sync error:', error);
-        Alert.alert('Error', 'No se pudo sincronizar con Odoo: ' + error.message);
-    } finally {
-        setIsSyncing(false);
-    }
-  };
 
   return (
     <ScrollView style={styles.container}>
@@ -100,11 +75,7 @@ export default function DashboardScreen() {
             key={index}
             style={[styles.card, { backgroundColor: item.color }]}
             onPress={() => {
-                if (item.action === 'sync') {
-                    handleSync();
-                } else {
-                    router.push(item.route as any);
-                }
+                router.push(item.route as any);
             }}
           >
             <View style={styles.iconContainer}>
